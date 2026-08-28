@@ -38,6 +38,27 @@ type endpointServer struct {
 // returns, regardless of failure. The provided stream must unblock read and
 // write operations when closed.
 func ServeEndpoint(logger *logging.Logger, stream io.ReadWriteCloser) error {
+	return serveEndpoint(logger, stream, "")
+}
+
+// ServeEndpointAtRoot creates and serves an endpoint server that accepts only
+// the specified synchronization root. It allows the process launching an
+// endpoint agent to enforce target-owned path authorization independently of
+// the remote controller's initialization request.
+func ServeEndpointAtRoot(logger *logging.Logger, stream io.ReadWriteCloser, root string) error {
+	if root == "" {
+		stream.Close()
+		return errors.New("empty enforced synchronization root")
+	}
+	normalizedRoot, err := filesystem.Normalize(root)
+	if err != nil {
+		stream.Close()
+		return fmt.Errorf("unable to normalize enforced synchronization root: %w", err)
+	}
+	return serveEndpoint(logger, stream, normalizedRoot)
+}
+
+func serveEndpoint(logger *logging.Logger, stream io.ReadWriteCloser, enforcedRoot string) error {
 	// Perform the compression handshake.
 	compressionAlgorithm, err := compression.ServerHandshake(stream)
 	if err != nil {
@@ -102,6 +123,12 @@ func ServeEndpoint(logger *logging.Logger, stream io.ReadWriteCloser) error {
 		return err
 	} else {
 		request.Root = r
+	}
+	if enforcedRoot != "" && request.Root != enforcedRoot {
+		err = errors.New("requested synchronization root does not match enforced root")
+		encoder.Encode(&InitializeSynchronizationResponse{Error: err.Error()})
+		flusher.Flush()
+		return err
 	}
 
 	// Create the underlying endpoint. If it fails to create, then send a

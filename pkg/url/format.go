@@ -10,6 +10,8 @@ func (u *URL) Format(environmentPrefix string) string {
 		return u.formatLocal()
 	} else if u.Protocol == Protocol_SSH {
 		return u.formatSSH()
+	} else if u.Protocol == Protocol_Happier {
+		return u.formatHappier()
 	} else if u.Protocol == Protocol_Docker {
 		return u.formatDocker(environmentPrefix)
 	}

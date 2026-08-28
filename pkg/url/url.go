@@ -11,6 +11,14 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/url/forwarding"
 )
 
+const (
+	// HappierRootGrantIdentifierParameter names the non-secret identifier of the
+	// target-owned authorization grant that binds a synchronization session to
+	// its approved remote root. Credential material is resolved by Happier at
+	// dial time and is never persisted in or formatted as a Mutagen URL.
+	HappierRootGrantIdentifierParameter = "rootGrantId"
+)
+
 // Supported returns whether or not a URL kind is supported.
 func (k Kind) Supported() bool {
 	switch k {
@@ -31,6 +39,8 @@ func (p Protocol) MarshalText() ([]byte, error) {
 		result = "local"
 	case Protocol_SSH:
 		result = "ssh"
+	case Protocol_Happier:
+		result = "happier"
 	case Protocol_Docker:
 		result = "docker"
 	default:
@@ -50,6 +60,8 @@ func (p *Protocol) UnmarshalText(textBytes []byte) error {
 		*p = Protocol_Local
 	case "ssh":
 		*p = Protocol_SSH
+	case "happier":
+		*p = Protocol_Happier
 	case "docker":
 		*p = Protocol_Docker
 	default:
@@ -93,6 +105,20 @@ func (u *URL) EnsureValid() error {
 			return errors.New("SSH URL with invalid port")
 		} else if len(u.Environment) != 0 {
 			return errors.New("SSH URL with environment variables")
+		}
+	} else if u.Protocol == Protocol_Happier {
+		if u.Kind != Kind_Synchronization {
+			return errors.New("Happier URL for non-synchronization resource")
+		} else if u.User != "" {
+			return errors.New("Happier URL with non-empty username")
+		} else if u.Host == "" {
+			return errors.New("Happier URL with empty machine identifier")
+		} else if u.Port != 0 {
+			return errors.New("Happier URL with non-zero port")
+		} else if len(u.Environment) != 0 {
+			return errors.New("Happier URL with environment variables")
+		} else if len(u.Parameters) != 1 || u.Parameters[HappierRootGrantIdentifierParameter] == "" {
+			return errors.New("Happier URL without exactly one root grant parameter")
 		}
 	} else if u.Protocol == Protocol_Docker {
 		// In the case of Docker, we intentionally avoid validating environment

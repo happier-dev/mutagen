@@ -88,7 +88,11 @@ func synchronizerMain(_ *cobra.Command, _ []string) error {
 	// termination.
 	synchronizationTermination := make(chan error, 1)
 	go func() {
-		synchronizationTermination <- remote.ServeEndpoint(logger, stream)
+		if synchronizerConfiguration.root != "" {
+			synchronizationTermination <- remote.ServeEndpointAtRoot(logger, stream, synchronizerConfiguration.root)
+		} else {
+			synchronizationTermination <- remote.ServeEndpoint(logger, stream)
+		}
 	}()
 
 	// Wait for termination from a signal or the synchronizer.
@@ -115,6 +119,8 @@ var synchronizerConfiguration struct {
 	help bool
 	// logLevel indicates the log level to use.
 	logLevel string
+	// root restricts the synchronization endpoint to a target-owned root.
+	root string
 }
 
 func init() {
@@ -130,4 +136,5 @@ func init() {
 
 	// Wire up logging flags.
 	flags.StringVar(&synchronizerConfiguration.logLevel, agent.FlagLogLevel, "", "Set the log level")
+	flags.StringVar(&synchronizerConfiguration.root, "root", "", "Restrict the synchronization root")
 }
