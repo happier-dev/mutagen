@@ -19,10 +19,10 @@ enum Protocol {
     // SSH indicates that the resource is accessible via SSH.
     SSH = 1;
 
-    // Happier indicates that the resource is reachable through a
-    // Happier-authenticated byte stream. This fork consumes Mutagen's custom
+    // External indicates that the resource is reachable through an
+    // externally-authenticated byte stream. This fork consumes Mutagen's custom
     // protocol slot while retaining the wire number reserved upstream.
-    Happier = 2;
+    External = 2;
 
     // Enumeration value 3 was previously used for the mutagen.io-based tunnel
     // protocol. This protocol was experimental and only available as part of

@@ -1,6 +1,6 @@
-// Package happier connects Mutagen synchronization endpoints through streams
-// established and authorized by the Happier daemon.
-package happier
+// Package external connects Mutagen synchronization endpoints through streams
+// established and authorized by an external transport.
+package external
 
 import (
 	"context"
@@ -16,9 +16,9 @@ import (
 	urlpkg "github.com/mutagen-io/mutagen/pkg/url"
 )
 
-// DialRequest contains the authority and endpoint metadata that Happier needs
+// DialRequest contains the authority and endpoint metadata that the external transport needs
 // to establish a stream. Carrier selection deliberately does not appear here:
-// the Happier daemon owns direct-versus-relay routing behind this contract.
+// the transport owns direct-versus-relay routing behind this contract.
 type DialRequest struct {
 	MachineIdentifier   string
 	RootGrantIdentifier string
@@ -27,7 +27,7 @@ type DialRequest struct {
 	Alpha               bool
 }
 
-// StreamDialer establishes an authenticated, full-duplex stream to a Happier
+// StreamDialer establishes an authenticated, full-duplex stream to an external
 // machine. Closing the stream must unblock pending reads and writes.
 type StreamDialer interface {
 	Dial(context.Context, DialRequest) (io.ReadWriteCloser, error)
@@ -38,10 +38,10 @@ type protocolHandler struct {
 }
 
 // NewProtocolHandler creates a synchronization protocol handler backed by the
-// specified Happier stream dialer.
+// specified external stream dialer.
 func NewProtocolHandler(dialer StreamDialer) synchronization.ProtocolHandler {
 	if dialer == nil {
-		panic("nil Happier stream dialer")
+		panic("nil External stream dialer")
 	}
 	return &protocolHandler{dialer: dialer}
 }
@@ -57,16 +57,16 @@ func (h *protocolHandler) Connect(
 	alpha bool,
 ) (synchronization.Endpoint, error) {
 	if url.Kind != urlpkg.Kind_Synchronization {
-		panic("non-synchronization URL dispatched to Happier protocol handler")
-	} else if url.Protocol != urlpkg.Protocol_Happier {
-		panic("non-Happier URL dispatched to Happier protocol handler")
+		panic("non-synchronization URL dispatched to External protocol handler")
+	} else if url.Protocol != urlpkg.Protocol_External {
+		panic("non-External URL dispatched to External protocol handler")
 	} else if err := url.EnsureValid(); err != nil {
-		return nil, fmt.Errorf("invalid Happier endpoint URL: %w", err)
+		return nil, fmt.Errorf("invalid External endpoint URL: %w", err)
 	}
 
 	stream, err := h.dialer.Dial(ctx, DialRequest{
 		MachineIdentifier:   url.Host,
-		RootGrantIdentifier: url.Parameters[urlpkg.HappierRootGrantIdentifierParameter],
+		RootGrantIdentifier: url.Parameters[urlpkg.ExternalRootGrantIdentifierParameter],
 		Root:                url.Path,
 		SessionIdentifier:   session,
 		Alpha:               alpha,
@@ -75,7 +75,7 @@ func (h *protocolHandler) Connect(
 		if errors.Is(err, context.Canceled) {
 			return nil, context.Canceled
 		}
-		return nil, fmt.Errorf("unable to dial Happier synchronization stream: %w", err)
+		return nil, fmt.Errorf("unable to dial External synchronization stream: %w", err)
 	}
 	stopCancellation := context.AfterFunc(ctx, func() { stream.Close() })
 	defer stopCancellation()
@@ -84,13 +84,13 @@ func (h *protocolHandler) Connect(
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("unable to handshake with Happier synchronization agent: %w", err)
+		return nil, fmt.Errorf("unable to handshake with External synchronization agent: %w", err)
 	} else if err := mutagen.ClientVersionHandshake(stream); err != nil {
 		stream.Close()
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("Happier synchronization agent version handshake failed: %w", err)
+		return nil, fmt.Errorf("External synchronization agent version handshake failed: %w", err)
 	}
 
 	endpoint, err := remote.NewEndpoint(logger, stream, url.Path, session, version, configuration, alpha)

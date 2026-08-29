@@ -20,7 +20,7 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/synchronization/compression"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/endpoint/remote"
-	happierprotocol "github.com/mutagen-io/mutagen/pkg/synchronization/protocols/happier"
+	externalprotocol "github.com/mutagen-io/mutagen/pkg/synchronization/protocols/external"
 	"github.com/mutagen-io/mutagen/pkg/url"
 )
 
@@ -54,7 +54,7 @@ type authorizedEndpointDialer struct {
 
 func (d *authorizedEndpointDialer) Dial(
 	_ context.Context,
-	request happierprotocol.DialRequest,
+	request externalprotocol.DialRequest,
 ) (io.ReadWriteCloser, error) {
 	if request.MachineIdentifier != d.machineIdentifier {
 		return nil, errors.New("unauthorized machine")
@@ -147,7 +147,7 @@ func waitForConnectedSession(
 	}
 }
 
-func createHappierSession(
+func createExternalSession(
 	t *testing.T,
 	alphaRoot, betaRoot, rootGrantIdentifier string,
 	mode core.SynchronizationMode,
@@ -159,11 +159,11 @@ func createHappierSession(
 		ctx,
 		&url.URL{Path: alphaRoot},
 		&url.URL{
-			Protocol: url.Protocol_Happier,
+			Protocol: url.Protocol_External,
 			Host:     "machine-beta",
 			Path:     betaRoot,
 			Parameters: map[string]string{
-				url.HappierRootGrantIdentifierParameter: rootGrantIdentifier,
+				url.ExternalRootGrantIdentifierParameter: rootGrantIdentifier,
 			},
 		},
 		&synchronization.Configuration{
@@ -172,7 +172,7 @@ func createHappierSession(
 		},
 		&synchronization.Configuration{},
 		&synchronization.Configuration{},
-		"happier-transport-spike",
+		"external-transport-spike",
 		nil,
 		false,
 		"",
@@ -197,7 +197,7 @@ func requireFileContents(t *testing.T, path string, expected []byte) {
 	}
 }
 
-func TestSynchronizationThroughHappierTransport(t *testing.T) {
+func TestSynchronizationThroughExternalTransport(t *testing.T) {
 	oneWayAlpha := filepath.Join(t.TempDir(), "alpha")
 	oneWayBeta := filepath.Join(t.TempDir(), "beta")
 	twoWayAlpha := filepath.Join(t.TempDir(), "alpha")
@@ -215,7 +215,7 @@ func TestSynchronizationThroughHappierTransport(t *testing.T) {
 			"two-way-root": twoWayBeta,
 		},
 	}
-	synchronization.ProtocolHandlers[url.Protocol_Happier] = happierprotocol.NewProtocolHandler(dialer)
+	synchronization.ProtocolHandlers[url.Protocol_External] = externalprotocol.NewProtocolHandler(dialer)
 
 	largeContents := make([]byte, 4*1024*1024)
 	for index := range largeContents {
@@ -225,7 +225,7 @@ func TestSynchronizationThroughHappierTransport(t *testing.T) {
 		t.Fatal("unable to write one-way source file:", err)
 	}
 
-	oneWaySession := createHappierSession(
+	oneWaySession := createExternalSession(
 		t,
 		oneWayAlpha,
 		oneWayBeta,
@@ -251,7 +251,7 @@ func TestSynchronizationThroughHappierTransport(t *testing.T) {
 	dialsBeforeDisconnect := dialer.dialCount.Load()
 	dialer.disconnectActiveStreams()
 	waitForConnectedSession(t, oneWaySession, dialer, dialsBeforeDisconnect+1)
-	reconnectContents := []byte("reconnected through a fresh Happier stream")
+	reconnectContents := []byte("reconnected through a fresh External stream")
 	if err := os.WriteFile(filepath.Join(oneWayAlpha, "after-reconnect.txt"), reconnectContents, 0o600); err != nil {
 		t.Fatal("unable to write reconnect source file:", err)
 	}
@@ -261,7 +261,7 @@ func TestSynchronizationThroughHappierTransport(t *testing.T) {
 		t.Fatalf("transport loss did not trigger a fresh dial: %d", count)
 	}
 
-	twoWaySession := createHappierSession(
+	twoWaySession := createExternalSession(
 		t,
 		twoWayAlpha,
 		twoWayBeta,
@@ -319,7 +319,7 @@ func TestSynchronizationThroughHappierTransport(t *testing.T) {
 	}
 
 	t.Logf(
-		"Happier transport spike transferred %d bytes across %d stream dials; 4 MiB small-edit delta used %d bytes",
+		"External transport spike transferred %d bytes across %d stream dials; 4 MiB small-edit delta used %d bytes",
 		dialer.transferredBytes(),
 		dialer.dialCount.Load(),
 		deltaBytes,

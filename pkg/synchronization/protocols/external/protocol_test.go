@@ -1,4 +1,4 @@
-package happier
+package external
 
 import (
 	"bytes"
@@ -88,11 +88,11 @@ func TestProtocolHandlerRejectsPackagedAgentRootMismatch(t *testing.T) {
 		nil,
 		&urlpkg.URL{
 			Kind:     urlpkg.Kind_Synchronization,
-			Protocol: urlpkg.Protocol_Happier,
+			Protocol: urlpkg.Protocol_External,
 			Host:     "machine-01",
 			Path:     t.TempDir(),
 			Parameters: map[string]string{
-				urlpkg.HappierRootGrantIdentifierParameter: "grant-01",
+				urlpkg.ExternalRootGrantIdentifierParameter: "grant-01",
 			},
 		},
 		"",
@@ -119,11 +119,11 @@ func TestProtocolHandlerConnectsPackagedAgentProcess(t *testing.T) {
 		nil,
 		&urlpkg.URL{
 			Kind:     urlpkg.Kind_Synchronization,
-			Protocol: urlpkg.Protocol_Happier,
+			Protocol: urlpkg.Protocol_External,
 			Host:     "machine-01",
 			Path:     root,
 			Parameters: map[string]string{
-				urlpkg.HappierRootGrantIdentifierParameter: "grant-01",
+				urlpkg.ExternalRootGrantIdentifierParameter: "grant-01",
 			},
 		},
 		"",
@@ -173,11 +173,11 @@ func TestProtocolHandlerConnectsRemoteEndpointThroughDialer(t *testing.T) {
 		nil,
 		&urlpkg.URL{
 			Kind:     urlpkg.Kind_Synchronization,
-			Protocol: urlpkg.Protocol_Happier,
+			Protocol: urlpkg.Protocol_External,
 			Host:     "machine-01",
 			Path:     root,
 			Parameters: map[string]string{
-				urlpkg.HappierRootGrantIdentifierParameter: "grant-01",
+				urlpkg.ExternalRootGrantIdentifierParameter: "grant-01",
 			},
 		},
 		"",
@@ -187,7 +187,7 @@ func TestProtocolHandlerConnectsRemoteEndpointThroughDialer(t *testing.T) {
 		false,
 	)
 	if err != nil {
-		t.Fatal("unable to connect through Happier dialer:", err)
+		t.Fatal("unable to connect through External dialer:", err)
 	}
 
 	if dialer.request.MachineIdentifier != "machine-01" {
@@ -248,11 +248,11 @@ func TestProtocolHandlerCancelsStalledAgentHandshake(t *testing.T) {
 			nil,
 			&urlpkg.URL{
 				Kind:     urlpkg.Kind_Synchronization,
-				Protocol: urlpkg.Protocol_Happier,
+				Protocol: urlpkg.Protocol_External,
 				Host:     "machine-01",
 				Path:     "/workspace",
 				Parameters: map[string]string{
-					urlpkg.HappierRootGrantIdentifierParameter: "grant-01",
+					urlpkg.ExternalRootGrantIdentifierParameter: "grant-01",
 				},
 			},
 			"",
@@ -287,11 +287,11 @@ func TestProtocolHandlerPropagatesDialCancellation(t *testing.T) {
 		nil,
 		&urlpkg.URL{
 			Kind:     urlpkg.Kind_Synchronization,
-			Protocol: urlpkg.Protocol_Happier,
+			Protocol: urlpkg.Protocol_External,
 			Host:     "machine-01",
 			Path:     "/workspace",
 			Parameters: map[string]string{
-				urlpkg.HappierRootGrantIdentifierParameter: "grant-01",
+				urlpkg.ExternalRootGrantIdentifierParameter: "grant-01",
 			},
 		},
 		"",

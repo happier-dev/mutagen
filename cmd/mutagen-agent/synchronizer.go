@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -49,6 +50,9 @@ func housekeepRegularly(ctx context.Context, logger *logging.Logger) {
 
 // synchronizerMain is the entry point for the synchronizer command.
 func synchronizerMain(_ *cobra.Command, _ []string) error {
+	if synchronizerConfiguration.root == "" {
+		return errors.New("missing required --root")
+	}
 	// Create a channel to track termination signals. We do this before creating
 	// and starting other infrastructure so that we can ensure things terminate
 	// smoothly, not mid-initialization.
@@ -88,11 +92,7 @@ func synchronizerMain(_ *cobra.Command, _ []string) error {
 	// termination.
 	synchronizationTermination := make(chan error, 1)
 	go func() {
-		if synchronizerConfiguration.root != "" {
-			synchronizationTermination <- remote.ServeEndpointAtRoot(logger, stream, synchronizerConfiguration.root)
-		} else {
-			synchronizationTermination <- remote.ServeEndpoint(logger, stream)
-		}
+		synchronizationTermination <- remote.ServeEndpointAtRoot(logger, stream, synchronizerConfiguration.root)
 	}()
 
 	// Wait for termination from a signal or the synchronizer.
@@ -137,4 +137,7 @@ func init() {
 	// Wire up logging flags.
 	flags.StringVar(&synchronizerConfiguration.logLevel, agent.FlagLogLevel, "", "Set the log level")
 	flags.StringVar(&synchronizerConfiguration.root, "root", "", "Restrict the synchronization root")
+	if err := synchronizerCommand.MarkFlagRequired("root"); err != nil {
+		panic(err)
+	}
 }
