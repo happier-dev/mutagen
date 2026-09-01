@@ -44,15 +44,45 @@ func TestHappierReleasePreservesMixedLicenseBuildContract(t *testing.T) {
 	if publishJob.Environment != "release" {
 		t.Errorf("publish job environment is %q, want release", publishJob.Environment)
 	}
+	var setupStep *releaseWorkflowStep
+	var setupStepIndex = -1
 	var signingStep *releaseWorkflowStep
+	var signingStepIndex = -1
 	for index := range publishJob.Steps {
+		if publishJob.Steps[index].Name == "Set up checksum-verified Minisign" {
+			setupStep = &publishJob.Steps[index]
+			setupStepIndex = index
+		}
 		if publishJob.Steps[index].Name == "Sign aggregate checksums" {
 			signingStep = &publishJob.Steps[index]
-			break
+			signingStepIndex = index
 		}
+	}
+	if setupStep == nil {
+		t.Fatal("publish job has no checksum-verified Minisign setup step")
 	}
 	if signingStep == nil {
 		t.Fatal("publish job has no aggregate-checksum signing step")
+	}
+	if setupStepIndex >= signingStepIndex {
+		t.Fatal("checksum-verified Minisign setup must precede the secret-bearing signing step")
+	}
+	if len(setupStep.Env) != 0 {
+		t.Fatal("Minisign setup step must not receive signing secrets")
+	}
+	for _, requiredCommand := range []string{
+		`minisign_version="0.12"`,
+		`minisign_archive_sha256="9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73"`,
+		`minisign_binary_sha256="2c74dffcc1c9a5ee55957c60971998ace2b89f22585631594ec2152c588af8db"`,
+		`test "$(uname -m)" = "x86_64"`,
+		`https://github.com/jedisct1/minisign/releases/download/${minisign_version}/minisign-${minisign_version}-linux.tar.gz`,
+		`sha256sum --check --strict -`,
+		`test "$("${minisign_root}/minisign" -v 2>&1)" = "minisign ${minisign_version}"`,
+		`echo "${minisign_root}" >> "${GITHUB_PATH}"`,
+	} {
+		if !strings.Contains(setupStep.Run, requiredCommand) {
+			t.Errorf("Minisign setup command is missing %q", requiredCommand)
+		}
 	}
 	expectedSigningEnvironment := map[string]string{
 		"MINISIGN_PASSPHRASE": "${{ secrets.MINISIGN_PASSPHRASE }}",
@@ -100,6 +130,9 @@ func TestHappierReleasePreservesMixedLicenseBuildContract(t *testing.T) {
 	for _, forbiddenCommand := range []string{
 		"MINISIGN_PASSWORD",
 		"set -x",
+		"apt-get",
+		"curl",
+		"tar ",
 		`echo "${MINISIGN_PASSPHRASE}"`,
 	} {
 		if strings.Contains(signingStep.Run, forbiddenCommand) {

@@ -178,6 +178,26 @@ jobs:
           bash scripts/ci/validate_release_tag.sh "${GITHUB_REF_NAME}"
           test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "${GITHUB_REF_NAME}")"
           git archive --format=tar.gz --prefix="happier-mutagen-${GITHUB_REF_NAME}/" --output="dist/happier-mutagen-source-${GITHUB_REF_NAME}.tar.gz" "${GITHUB_REF_NAME}"
+      - name: Set up checksum-verified Minisign
+        shell: bash
+        run: |
+          set -euo pipefail
+          minisign_version="0.12"
+          minisign_archive="${RUNNER_TEMP}/minisign-${minisign_version}-linux.tar.gz"
+          minisign_archive_sha256="9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73"
+          minisign_binary_sha256="2c74dffcc1c9a5ee55957c60971998ace2b89f22585631594ec2152c588af8db"
+          test "$(uname -m)" = "x86_64"
+          curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --retry-delay 2 --retry-max-time 120 -fsSL \
+            -o "${minisign_archive}" \
+            "https://github.com/jedisct1/minisign/releases/download/${minisign_version}/minisign-${minisign_version}-linux.tar.gz"
+          printf '%s  %s\n' "${minisign_archive_sha256}" "${minisign_archive}" | sha256sum --check --strict -
+          minisign_root="${RUNNER_TEMP}/verified-minisign-${minisign_version}"
+          mkdir -p "${minisign_root}"
+          tar --extract --gzip --file "${minisign_archive}" --directory "${minisign_root}" --no-same-owner
+          install -m 0755 "${minisign_root}/minisign-linux/x86_64/minisign" "${minisign_root}/minisign"
+          printf '%s  %s\n' "${minisign_binary_sha256}" "${minisign_root}/minisign" | sha256sum --check --strict -
+          test "$("${minisign_root}/minisign" -v 2>&1)" = "minisign ${minisign_version}"
+          echo "${minisign_root}" >> "${GITHUB_PATH}"
       - name: Sign aggregate checksums
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
@@ -188,8 +208,6 @@ jobs:
           umask 077
           test -n "${MINISIGN_SECRET_KEY}"
           test -n "${MINISIGN_PASSPHRASE}"
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends minisign
           (cd dist && sha256sum * > "checksums-happier-${GITHUB_REF_NAME}.txt")
           trap 'rm -f minisign.key' EXIT
           printf '%s' "${MINISIGN_SECRET_KEY}" > minisign.key
