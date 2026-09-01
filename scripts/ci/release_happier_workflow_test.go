@@ -3,11 +3,27 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v2"
 )
+
+type releaseWorkflow struct {
+	Jobs map[string]releaseWorkflowJob `yaml:"jobs"`
+}
+
+type releaseWorkflowJob struct {
+	Environment string                `yaml:"environment"`
+	Steps       []releaseWorkflowStep `yaml:"steps"`
+}
+
+type releaseWorkflowStep struct {
+	Name string            `yaml:"name"`
+	Env  map[string]string `yaml:"env"`
+	Run  string            `yaml:"run"`
+}
 
 func TestHappierReleasePreservesMixedLicenseBuildContract(t *testing.T) {
 	repositoryRoot := filepath.Join("..", "..")
@@ -17,9 +33,78 @@ func TestHappierReleasePreservesMixedLicenseBuildContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	workflow := string(workflowBytes)
-	var parsedWorkflow map[interface{}]interface{}
+	var parsedWorkflow releaseWorkflow
 	if err := yaml.Unmarshal(workflowBytes, &parsedWorkflow); err != nil {
 		t.Fatalf("Happier release workflow is not valid YAML: %v", err)
+	}
+	publishJob, ok := parsedWorkflow.Jobs["publish"]
+	if !ok {
+		t.Fatal("Happier release workflow has no publish job")
+	}
+	if publishJob.Environment != "release" {
+		t.Errorf("publish job environment is %q, want release", publishJob.Environment)
+	}
+	var signingStep *releaseWorkflowStep
+	for index := range publishJob.Steps {
+		if publishJob.Steps[index].Name == "Sign aggregate checksums" {
+			signingStep = &publishJob.Steps[index]
+			break
+		}
+	}
+	if signingStep == nil {
+		t.Fatal("publish job has no aggregate-checksum signing step")
+	}
+	expectedSigningEnvironment := map[string]string{
+		"MINISIGN_PASSPHRASE": "${{ secrets.MINISIGN_PASSPHRASE }}",
+		"MINISIGN_SECRET_KEY": "${{ secrets.MINISIGN_SECRET_KEY }}",
+	}
+	if len(signingStep.Env) != len(expectedSigningEnvironment) {
+		t.Errorf("signing step environment has %d entries, want %d", len(signingStep.Env), len(expectedSigningEnvironment))
+	}
+	for name, expectedValue := range expectedSigningEnvironment {
+		if actualValue := signingStep.Env[name]; actualValue != expectedValue {
+			t.Errorf("signing step environment %s is %q, want %q", name, actualValue, expectedValue)
+		}
+	}
+	secretReferencePattern := regexp.MustCompile(`secrets\.([A-Za-z0-9_]+)`)
+	secretReferences := secretReferencePattern.FindAllStringSubmatch(workflow, -1)
+	if len(secretReferences) != 2 {
+		t.Errorf("Happier release workflow has %d secret references, want 2", len(secretReferences))
+	}
+	for _, expectedSecret := range []string{"MINISIGN_PASSPHRASE", "MINISIGN_SECRET_KEY"} {
+		count := 0
+		for _, reference := range secretReferences {
+			if reference[1] == expectedSecret {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Errorf("Happier release workflow references secret %s %d times, want once", expectedSecret, count)
+		}
+	}
+	for _, requiredCommand := range []string{
+		"set +x",
+		"umask 077",
+		`trap 'rm -f minisign.key' EXIT`,
+		`test -n "${MINISIGN_SECRET_KEY}"`,
+		`test -n "${MINISIGN_PASSPHRASE}"`,
+		`printf '%s\n' "${MINISIGN_PASSPHRASE}" | minisign -Sm "dist/checksums-happier-${GITHUB_REF_NAME}.txt" -s minisign.key`,
+	} {
+		if !strings.Contains(signingStep.Run, requiredCommand) {
+			t.Errorf("signing command is missing %q", requiredCommand)
+		}
+	}
+	if strings.Count(signingStep.Run, "MINISIGN_PASSPHRASE") != 2 {
+		t.Error("signing command must use its passphrase only for a non-empty check and minisign stdin")
+	}
+	for _, forbiddenCommand := range []string{
+		"MINISIGN_PASSWORD",
+		"set -x",
+		`echo "${MINISIGN_PASSPHRASE}"`,
+	} {
+		if strings.Contains(signingStep.Run, forbiddenCommand) {
+			t.Errorf("signing command exposes or misroutes the passphrase via %q", forbiddenCommand)
+		}
 	}
 	provenanceBytes, err := os.ReadFile(filepath.Join(repositoryRoot, "fork-provenance.json"))
 	if err != nil {
