@@ -25,7 +25,8 @@ func TestHappierReleasePreservesMixedLicenseBuildContract(t *testing.T) {
 	for _, required := range []string{
 		"mutagensidecar,mutagensspl",
 		"mutagenagent,mutagensspl",
-		"mutagenfanotify",
+		"watcher: polling",
+		"runner: macos-15-intel",
 		"licenses/SSPL-LICENSE",
 		`"licensePolicy":"mixed-mit-sspl"`,
 		`"ssplEnabled":true`,
@@ -39,6 +40,8 @@ func TestHappierReleasePreservesMixedLicenseBuildContract(t *testing.T) {
 	}
 
 	for _, forbidden := range []string{
+		"mutagenfanotify",
+		"runner: macos-13",
 		"test ! -e sspl",
 		`"licensePolicy":"mit-only"`,
 		`"ssplEnabled":false`,

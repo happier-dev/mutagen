@@ -20,7 +20,7 @@ jobs:
             goarch: arm64
             cgo: '1'
             watcher: fsevents
-          - runner: macos-13
+          - runner: macos-15-intel
             target: darwin-amd64
             goos: darwin
             goarch: amd64
@@ -31,13 +31,13 @@ jobs:
             goos: linux
             goarch: amd64
             cgo: '0'
-            watcher: fanotify-when-supported
+            watcher: polling
           - runner: ubuntu-22.04-arm
             target: linux-arm64
             goos: linux
             goarch: arm64
             cgo: '0'
-            watcher: fanotify-when-supported
+            watcher: polling
           - runner: windows-2022
             target: windows-amd64
             goos: windows
@@ -107,13 +107,6 @@ jobs:
           agent_tags="mutagenagent,mutagensspl"
           build_tags_json='["mutagensidecar","mutagensspl","mutagenagent"]'
           agent_tags_json='["mutagenagent","mutagensspl"]'
-          if [[ "${GOOS}" == linux ]]; then
-            # This is the upstream opt-in contract for fanotify. Runtime support
-            # remains conditional on the kernel and process capabilities.
-            agent_tags="${agent_tags},mutagenfanotify"
-            build_tags_json='["mutagensidecar","mutagensspl","mutagenagent","mutagenfanotify"]'
-            agent_tags_json='["mutagenagent","mutagensspl","mutagenfanotify"]'
-          fi
           go build -trimpath -ldflags "${ldflags}" -tags "${manager_tags}" -o "${root}/bin/happier-mutagen" ./cmd/mutagen-sidecar
           go build -trimpath -ldflags "${ldflags}" -tags "${agent_tags}" -o "${root}/bin/happier-mutagen-agent" ./cmd/mutagen-agent
           cp LICENSE "${root}/licenses/MUTAGEN-LICENSE"
