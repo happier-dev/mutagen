@@ -32,6 +32,7 @@ func TestHappierReleasePreservesMixedLicenseBuildContract(t *testing.T) {
 		"mutagenagent,mutagensspl",
 		"watcher: polling",
 		"runner: macos-15-intel",
+		"curl --retry 5 --retry-all-errors --retry-delay 2 --retry-max-time 120 -fsSLO",
 		"sha256_file()",
 		"licenses/SSPL-LICENSE",
 		`"licensePolicy":"mixed-mit-sspl"`,

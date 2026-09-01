@@ -66,7 +66,7 @@ jobs:
             windows-amd64) go_archive=go1.22.12.windows-amd64.zip; go_checksum=2ceda04074eac51f4b0b85a9fcca38bcd49daee24bed9ea1f29958a8e22673a6 ;;
             *) echo "unsupported target: ${TARGET}" >&2; exit 1 ;;
           esac
-          curl -fsSLO "https://go.dev/dl/${go_archive}"
+          curl --retry 5 --retry-all-errors --retry-delay 2 --retry-max-time 120 -fsSLO "https://go.dev/dl/${go_archive}"
           observed_checksum="$(sha256sum "${go_archive}" 2>/dev/null | awk '{print $1}' || shasum -a 256 "${go_archive}" | awk '{print $1}')"
           if [[ "${observed_checksum}" != "${go_checksum}" ]]; then
             echo "Go distribution checksum mismatch for ${go_archive}: expected ${go_checksum}, observed ${observed_checksum}" >&2
