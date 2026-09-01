@@ -15,8 +15,7 @@
   },
   "happierReleaseBuildTags": {
     "manager": ["mutagensidecar", "mutagensspl"],
-    "agent": ["mutagenagent", "mutagensspl"],
-    "linuxAgentOptional": ["mutagenfanotify"]
+    "agent": ["mutagenagent", "mutagensspl"]
   },
   "protocol": {
     "epoch": "external-stream-v1",

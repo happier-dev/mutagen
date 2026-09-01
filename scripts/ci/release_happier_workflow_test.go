@@ -21,6 +21,11 @@ func TestHappierReleasePreservesMixedLicenseBuildContract(t *testing.T) {
 	if err := yaml.Unmarshal(workflowBytes, &parsedWorkflow); err != nil {
 		t.Fatalf("Happier release workflow is not valid YAML: %v", err)
 	}
+	provenanceBytes, err := os.ReadFile(filepath.Join(repositoryRoot, "fork-provenance.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenance := string(provenanceBytes)
 
 	for _, required := range []string{
 		"mutagensidecar,mutagensspl",
@@ -50,6 +55,9 @@ func TestHappierReleasePreservesMixedLicenseBuildContract(t *testing.T) {
 		if strings.Contains(workflow, forbidden) {
 			t.Errorf("Happier release workflow still contains obsolete policy %q", forbidden)
 		}
+	}
+	if strings.Contains(provenance, "mutagenfanotify") {
+		t.Error("fork provenance still claims fanotify for the Happier managed release")
 	}
 }
 
