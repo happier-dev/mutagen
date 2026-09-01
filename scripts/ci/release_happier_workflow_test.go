@@ -32,6 +32,7 @@ func TestHappierReleasePreservesMixedLicenseBuildContract(t *testing.T) {
 		"mutagenagent,mutagensspl",
 		"watcher: polling",
 		"runner: macos-15-intel",
+		"sha256_file()",
 		"licenses/SSPL-LICENSE",
 		`"licensePolicy":"mixed-mit-sspl"`,
 		`"ssplEnabled":true`,
@@ -47,6 +48,8 @@ func TestHappierReleasePreservesMixedLicenseBuildContract(t *testing.T) {
 	for _, forbidden := range []string{
 		"mutagenfanotify",
 		"runner: macos-13",
+		`manager_sha="$(shasum`,
+		`agent_sha="$(shasum`,
 		"test ! -e sspl",
 		`"licensePolicy":"mit-only"`,
 		`"ssplEnabled":false`,

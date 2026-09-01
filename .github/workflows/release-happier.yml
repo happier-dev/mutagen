@@ -114,8 +114,15 @@ jobs:
           # Mutagen's build-tag-aware canonical license registry includes its
           # dependency notices (including vendored and standard-library code).
           go run -tags mutagensspl ./scripts/ci/print_licenses > "${root}/licenses/THIRD-PARTY-NOTICES"
-          manager_sha="$(shasum -a 256 "${root}/bin/happier-mutagen" | awk '{print $1}')"
-          agent_sha="$(shasum -a 256 "${root}/bin/happier-mutagen-agent" | awk '{print $1}')"
+          sha256_file() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" | awk '{print $1}'
+            else
+              shasum -a 256 "$1" | awk '{print $1}'
+            fi
+          }
+          manager_sha="$(sha256_file "${root}/bin/happier-mutagen")"
+          agent_sha="$(sha256_file "${root}/bin/happier-mutagen-agent")"
           fork_commit="$(git rev-parse HEAD)"
           case "${{ matrix.target }}" in
             darwin-arm64) go_checksum=416c35218edb9d20990b5d8fc87be655d8b39926f15524ea35c66ee70273050d ;;
@@ -130,9 +137,9 @@ jobs:
           (
             cd "${root}"
             find bin licenses -type f -print | sort | while read -r path; do
-              shasum -a 256 "${path}"
+              printf '%s  %s\n' "$(sha256_file "${path}")" "${path}"
             done
-            shasum -a 256 .happier-mutagen-engine.json
+            printf '%s  %s\n' "$(sha256_file .happier-mutagen-engine.json)" .happier-mutagen-engine.json
           ) > "${root}/checksums.txt"
           if [[ "${GOOS}" == windows ]]; then
             (cd dist && 7z a "$(basename "${root}").zip" "$(basename "${root}")")
