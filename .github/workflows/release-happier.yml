@@ -1,0 +1,189 @@
+name: Happier Mutagen engine release
+
+on:
+  push:
+    tags:
+      - 'mutagen-v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: darwin-arm64
+            goos: darwin
+            goarch: arm64
+            cgo: '1'
+            watcher: fsevents
+          - runner: macos-13
+            target: darwin-amd64
+            goos: darwin
+            goarch: amd64
+            cgo: '1'
+            watcher: fsevents
+          - runner: ubuntu-22.04
+            target: linux-amd64
+            goos: linux
+            goarch: amd64
+            cgo: '0'
+            watcher: fanotify-when-supported
+          - runner: ubuntu-22.04-arm
+            target: linux-arm64
+            goos: linux
+            goarch: arm64
+            cgo: '0'
+            watcher: fanotify-when-supported
+          - runner: windows-2022
+            target: windows-amd64
+            goos: windows
+            goarch: amd64
+            cgo: '0'
+            watcher: native
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Set up checksum-verified Go toolchain
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          # setup-go cannot verify downloaded bytes. The release manifest records
+          # toolchain.goChecksum, so the build must install the exact go.dev/dl
+          # archive pinned by that checksum and fail closed on any mismatch.
+          case "${TARGET}" in
+            darwin-arm64) go_archive=go1.22.12.darwin-arm64.tar.gz; go_checksum=416c35218edb9d20990b5d8fc87be655d8b39926f15524ea35c66ee70273050d ;;
+            darwin-amd64) go_archive=go1.22.12.darwin-amd64.tar.gz; go_checksum=e7bbe07e96f0bd3df04225090fe1e7852ed33af37c43a23e16edbbb3b90a5b7c ;;
+            linux-amd64) go_archive=go1.22.12.linux-amd64.tar.gz; go_checksum=4fa4f869b0f7fc6bb1eb2660e74657fbf04cdd290b5aef905585c86051b34d43 ;;
+            linux-arm64) go_archive=go1.22.12.linux-arm64.tar.gz; go_checksum=fd017e647ec28525e86ae8203236e0653242722a7436929b1f775744e26278e7 ;;
+            windows-amd64) go_archive=go1.22.12.windows-amd64.zip; go_checksum=2ceda04074eac51f4b0b85a9fcca38bcd49daee24bed9ea1f29958a8e22673a6 ;;
+            *) echo "unsupported target: ${TARGET}" >&2; exit 1 ;;
+          esac
+          curl -fsSLO "https://go.dev/dl/${go_archive}"
+          observed_checksum="$(sha256sum "${go_archive}" 2>/dev/null | awk '{print $1}' || shasum -a 256 "${go_archive}" | awk '{print $1}')"
+          if [[ "${observed_checksum}" != "${go_checksum}" ]]; then
+            echo "Go distribution checksum mismatch for ${go_archive}: expected ${go_checksum}, observed ${observed_checksum}" >&2
+            exit 1
+          fi
+          go_home="${RUNNER_TEMP}/verified-go"
+          rm -rf "${go_home}"
+          mkdir -p "${go_home}"
+          if [[ "${go_archive}" == *.zip ]]; then
+            7z x "${go_archive}" -o"${go_home}" -y > /dev/null
+          else
+            tar -C "${go_home}" -xzf "${go_archive}"
+          fi
+          rm -f "${go_archive}"
+          echo "${go_home}/go/bin" >> "${GITHUB_PATH}"
+      - name: Verify immutable release basis
+        shell: bash
+        run: |
+          bash scripts/ci/validate_release_tag.sh "${GITHUB_REF_NAME}"
+          test "$(git tag --points-at HEAD)" = "${GITHUB_REF_NAME}"
+          test "$(git status --porcelain --untracked-files=all)" = ""
+          test "$(go env GOVERSION)" = "go1.22.12"
+          test -f sspl/LICENSE
+          git grep -q 'go:build mutagensspl' -- sspl pkg
+      - name: Build manager and agent pair
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: ${{ matrix.cgo }}
+        run: |
+          set -euo pipefail
+          root="dist/happier-mutagen-v${GITHUB_REF_NAME#mutagen-v}-${{ matrix.target }}"
+          mkdir -p "${root}/bin" "${root}/licenses"
+          identity="happier-external-stream-v1+${GITHUB_SHA}"
+          ldflags="-X github.com/mutagen-io/mutagen/pkg/mutagen.BuildIdentity=${identity}"
+          manager_tags="mutagensidecar,mutagensspl"
+          agent_tags="mutagenagent,mutagensspl"
+          build_tags_json='["mutagensidecar","mutagensspl","mutagenagent"]'
+          agent_tags_json='["mutagenagent","mutagensspl"]'
+          if [[ "${GOOS}" == linux ]]; then
+            # This is the upstream opt-in contract for fanotify. Runtime support
+            # remains conditional on the kernel and process capabilities.
+            agent_tags="${agent_tags},mutagenfanotify"
+            build_tags_json='["mutagensidecar","mutagensspl","mutagenagent","mutagenfanotify"]'
+            agent_tags_json='["mutagenagent","mutagensspl","mutagenfanotify"]'
+          fi
+          go build -trimpath -ldflags "${ldflags}" -tags "${manager_tags}" -o "${root}/bin/happier-mutagen" ./cmd/mutagen-sidecar
+          go build -trimpath -ldflags "${ldflags}" -tags "${agent_tags}" -o "${root}/bin/happier-mutagen-agent" ./cmd/mutagen-agent
+          cp LICENSE "${root}/licenses/MUTAGEN-LICENSE"
+          cp sspl/LICENSE "${root}/licenses/SSPL-LICENSE"
+          # Mutagen's build-tag-aware canonical license registry includes its
+          # dependency notices (including vendored and standard-library code).
+          go run -tags mutagensspl ./scripts/ci/print_licenses > "${root}/licenses/THIRD-PARTY-NOTICES"
+          manager_sha="$(shasum -a 256 "${root}/bin/happier-mutagen" | awk '{print $1}')"
+          agent_sha="$(shasum -a 256 "${root}/bin/happier-mutagen-agent" | awk '{print $1}')"
+          fork_commit="$(git rev-parse HEAD)"
+          case "${{ matrix.target }}" in
+            darwin-arm64) go_checksum=416c35218edb9d20990b5d8fc87be655d8b39926f15524ea35c66ee70273050d ;;
+            darwin-amd64) go_checksum=e7bbe07e96f0bd3df04225090fe1e7852ed33af37c43a23e16edbbb3b90a5b7c ;;
+            linux-amd64) go_checksum=4fa4f869b0f7fc6bb1eb2660e74657fbf04cdd290b5aef905585c86051b34d43 ;;
+            linux-arm64) go_checksum=fd017e647ec28525e86ae8203236e0653242722a7436929b1f775744e26278e7 ;;
+            windows-amd64) go_checksum=2ceda04074eac51f4b0b85a9fcca38bcd49daee24bed9ea1f29958a8e22673a6 ;;
+          esac
+          cat > "${root}/.happier-mutagen-engine.json" <<EOF
+          {"format":"happier-mutagen-engine","schemaVersion":1,"component":"mutagen-engine","engineVersion":"${GITHUB_REF_NAME#mutagen-v}","forkCommit":"${fork_commit}","forkBranch":"happier/external-stream-v1","sourceRepository":"https://github.com/happier-dev/mutagen","sourceTag":"${GITHUB_REF_NAME}","sourceArchive":"happier-mutagen-source-${GITHUB_REF_NAME}.tar.gz","transportSpikeCommit":"cd8069cf8b945dfa0d0f47d8685322c6f1e16e44","upstreamTag":"v0.18.1","upstreamCommit":"a225ae50aee3d7ebb59139203cb84e8a6a3ff4bf","toolchain":{"go":"1.22.12","goChecksum":"${go_checksum}"},"protocolEpoch":"external-stream-v1","targetTriple":"${{ matrix.target }}","managerPath":"bin/happier-mutagen","agentPath":"bin/happier-mutagen-agent","licensePolicy":"mixed-mit-sspl","ssplEnabled":true,"buildTags":${build_tags_json},"managerBuildTags":["mutagensidecar","mutagensspl"],"agentBuildTags":${agent_tags_json},"cgoEnabled":${{ matrix.cgo == '1' }},"watcher":"${{ matrix.watcher }}","releaseTag":"${GITHUB_REF_NAME}","managerSha256":"${manager_sha}","agentSha256":"${agent_sha}"}
+          EOF
+          (
+            cd "${root}"
+            find bin licenses -type f -print | sort | while read -r path; do
+              shasum -a 256 "${path}"
+            done
+            shasum -a 256 .happier-mutagen-engine.json
+          ) > "${root}/checksums.txt"
+          if [[ "${GOOS}" == windows ]]; then
+            (cd dist && 7z a "$(basename "${root}").zip" "$(basename "${root}")")
+          else
+            tar -C dist -czf "${root}.tar.gz" "$(basename "${root}")"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: engine-${{ matrix.target }}
+          path: dist/happier-mutagen-v*-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  publish:
+    runs-on: ubuntu-22.04
+    needs: build
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: engine-*
+          merge-multiple: true
+          path: dist
+      - name: Package corresponding source
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/ci/validate_release_tag.sh "${GITHUB_REF_NAME}"
+          test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "${GITHUB_REF_NAME}")"
+          git archive --format=tar.gz --prefix="happier-mutagen-${GITHUB_REF_NAME}/" --output="dist/happier-mutagen-source-${GITHUB_REF_NAME}.tar.gz" "${GITHUB_REF_NAME}"
+      - name: Sign aggregate checksums
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MUTAGEN_RELEASE_MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${MINISIGN_SECRET_KEY}"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends minisign
+          (cd dist && sha256sum * > "checksums-happier-${GITHUB_REF_NAME}.txt")
+          printf '%s' "${MINISIGN_SECRET_KEY}" > minisign.key
+          minisign -Sm "dist/checksums-happier-${GITHUB_REF_NAME}.txt" -s minisign.key
+          rm -f minisign.key
+      - uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true

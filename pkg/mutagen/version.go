@@ -29,6 +29,11 @@ const DevelopmentModeEnabled = VersionTag == "dev"
 // Version provides a stringified version of the current Mutagen version.
 var Version string
 
+// BuildIdentity is injected with the immutable fork commit for release builds.
+// Development builds share an explicit non-release identity so stock Mutagen
+// binaries and differently pinned Happier artifacts fail the handshake.
+var BuildIdentity = "happier-external-stream-v1+development"
+
 // init performs global initialization.
 func init() {
 	// Compute the stringified version.
@@ -75,6 +80,35 @@ func receiveVersion(reader io.Reader) (uint32, uint32, uint32, error) {
 	return major, minor, patch, nil
 }
 
+func sendBuildIdentity(writer io.Writer) error {
+	if BuildIdentity == "" || len(BuildIdentity) > 256 {
+		return errors.New("invalid build identity")
+	}
+	var size [4]byte
+	binary.BigEndian.PutUint32(size[:], uint32(len(BuildIdentity)))
+	if _, err := writer.Write(size[:]); err != nil {
+		return err
+	}
+	_, err := io.WriteString(writer, BuildIdentity)
+	return err
+}
+
+func receiveBuildIdentity(reader io.Reader) (string, error) {
+	var size [4]byte
+	if _, err := io.ReadFull(reader, size[:]); err != nil {
+		return "", err
+	}
+	length := binary.BigEndian.Uint32(size[:])
+	if length == 0 || length > 256 {
+		return "", errors.New("invalid build identity length")
+	}
+	identity := make([]byte, length)
+	if _, err := io.ReadFull(reader, identity); err != nil {
+		return "", err
+	}
+	return string(identity), nil
+}
+
 // ClientVersionHandshake performs the client side of a version handshake,
 // returning an error if the received server version is not compatible with the
 // client version.
@@ -86,10 +120,17 @@ func ClientVersionHandshake(stream io.ReadWriteCloser) error {
 	if err != nil {
 		return fmt.Errorf("unable to receive server version: %w", err)
 	}
+	serverBuildIdentity, err := receiveBuildIdentity(stream)
+	if err != nil {
+		return fmt.Errorf("unable to receive server build identity: %w", err)
+	}
 
 	// Send our version to the server.
 	if err := sendVersion(stream); err != nil {
 		return fmt.Errorf("unable to send client version: %w", err)
+	}
+	if err := sendBuildIdentity(stream); err != nil {
+		return fmt.Errorf("unable to send client build identity: %w", err)
 	}
 
 	// Ensure that our Mutagen versions are compatible. For now, we enforce that
@@ -101,7 +142,8 @@ func ClientVersionHandshake(stream io.ReadWriteCloser) error {
 	// implementation from that version.
 	versionMatch := serverMajor == VersionMajor &&
 		serverMinor == VersionMinor &&
-		serverPatch == VersionPatch
+		serverPatch == VersionPatch &&
+		serverBuildIdentity == BuildIdentity
 	if !versionMatch {
 		return errors.New("version mismatch")
 	}
@@ -120,18 +162,26 @@ func ServerVersionHandshake(stream io.ReadWriteCloser) error {
 	if err := sendVersion(stream); err != nil {
 		return fmt.Errorf("unable to send server version: %w", err)
 	}
+	if err := sendBuildIdentity(stream); err != nil {
+		return fmt.Errorf("unable to send server build identity: %w", err)
+	}
 
 	// Receive the client's version.
 	clientMajor, clientMinor, clientPatch, err := receiveVersion(stream)
 	if err != nil {
 		return fmt.Errorf("unable to receive client version: %w", err)
 	}
+	clientBuildIdentity, err := receiveBuildIdentity(stream)
+	if err != nil {
+		return fmt.Errorf("unable to receive client build identity: %w", err)
+	}
 
 	// Ensure that our versions are compatible. For now, we enforce that they're
 	// equal.
 	versionMatch := clientMajor == VersionMajor &&
 		clientMinor == VersionMinor &&
-		clientPatch == VersionPatch
+		clientPatch == VersionPatch &&
+		clientBuildIdentity == BuildIdentity
 	if !versionMatch {
 		return errors.New("version mismatch")
 	}

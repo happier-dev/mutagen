@@ -16,4 +16,7 @@ enum Syntax {
     // Syntax_SyntaxDocker specifies that Docker-style ignore syntax and
     // semantics should be used.
     SyntaxDocker = 2;
+    // SyntaxGitWorktree applies Git's endpoint-local tracked/untracked/ignore
+    // selection semantics plus the explicit session ignore/include overlay.
+    SyntaxGitWorktree = 3;
 }

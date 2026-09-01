@@ -1,13 +1,26 @@
 {
   "remote": "https://github.com/happier-dev/mutagen.git",
   "branch": "happier/external-stream-v1",
-  "forkCommit": "5582f671",
-  "forkCommitFull": "5582f67145136047dda45d17c97bdfc8a0a97bf0",
+  "sourceBaseCommit": "f5ed5c91fa6c934f5678393c56d00362d6443a1d",
   "transportSpikeCommit": "cd8069cf8b945dfa0d0f47d8685322c6f1e16e44",
   "upstreamTag": "v0.18.1",
   "upstreamCommit": "a225ae50aee3d7ebb59139203cb84e8a6a3ff4bf",
   "toolchain": {
-    "go": "1.22.0"
+    "go": "1.22.12"
   },
-  "protocol": "external://<opaque-id>?path=<root>&rootGrantId=<grant>"
+  "licensePolicy": {
+    "source": "mixed-mit-sspl",
+    "supportedBuildModes": ["non-sspl", "sspl"],
+    "happierRelease": "mixed-mit-sspl"
+  },
+  "happierReleaseBuildTags": {
+    "manager": ["mutagensidecar", "mutagensspl"],
+    "agent": ["mutagenagent", "mutagensspl"],
+    "linuxAgentOptional": ["mutagenfanotify"]
+  },
+  "protocol": {
+    "epoch": "external-stream-v1",
+    "urlShape": "external://<opaque-endpoint-id>",
+    "authorization": "connection-time-happier-owned"
+  }
 }

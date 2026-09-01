@@ -50,8 +50,16 @@ func housekeepRegularly(ctx context.Context, logger *logging.Logger) {
 
 // synchronizerMain is the entry point for the synchronizer command.
 func synchronizerMain(_ *cobra.Command, _ []string) error {
-	if synchronizerConfiguration.root == "" {
-		return errors.New("missing required --root")
+	if err := validateSynchronizerRootMode(); err != nil {
+		return err
+	}
+	var root string
+	if synchronizerConfiguration.external {
+		var err error
+		root, err = remote.ValidateEndpointRoot(synchronizerConfiguration.root)
+		if err != nil {
+			return fmt.Errorf("invalid --root: %w", err)
+		}
 	}
 	// Create a channel to track termination signals. We do this before creating
 	// and starting other infrastructure so that we can ensure things terminate
@@ -92,7 +100,11 @@ func synchronizerMain(_ *cobra.Command, _ []string) error {
 	// termination.
 	synchronizationTermination := make(chan error, 1)
 	go func() {
-		synchronizationTermination <- remote.ServeEndpointAtRoot(logger, stream, synchronizerConfiguration.root)
+		if synchronizerConfiguration.external {
+			synchronizationTermination <- remote.ServeEndpointAtRoot(logger, stream, root)
+		} else {
+			synchronizationTermination <- remote.ServeEndpoint(logger, stream)
+		}
 	}()
 
 	// Wait for termination from a signal or the synchronizer.
@@ -102,6 +114,16 @@ func synchronizerMain(_ *cobra.Command, _ []string) error {
 	case err := <-synchronizationTermination:
 		return fmt.Errorf("synchronization terminated: %w", err)
 	}
+}
+
+func validateSynchronizerRootMode() error {
+	if synchronizerConfiguration.external && synchronizerConfiguration.root == "" {
+		return errors.New("missing required --root for external synchronizer mode")
+	}
+	if !synchronizerConfiguration.external && synchronizerConfiguration.root != "" {
+		return errors.New("--root requires explicit --external synchronizer mode")
+	}
+	return nil
 }
 
 // synchronizerCommand is the synchronizer command.
@@ -121,6 +143,8 @@ var synchronizerConfiguration struct {
 	logLevel string
 	// root restricts the synchronization endpoint to a target-owned root.
 	root string
+	// external selects the root-confined external-stream serving contract.
+	external bool
 }
 
 func init() {
@@ -136,8 +160,6 @@ func init() {
 
 	// Wire up logging flags.
 	flags.StringVar(&synchronizerConfiguration.logLevel, agent.FlagLogLevel, "", "Set the log level")
+	flags.BoolVar(&synchronizerConfiguration.external, "external", false, "Serve a root-confined external-stream endpoint")
 	flags.StringVar(&synchronizerConfiguration.root, "root", "", "Restrict the synchronization root")
-	if err := synchronizerCommand.MarkFlagRequired("root"); err != nil {
-		panic(err)
-	}
 }

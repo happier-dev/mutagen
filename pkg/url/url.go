@@ -12,11 +12,10 @@ import (
 )
 
 const (
-	// ExternalRootGrantIdentifierParameter names the non-secret identifier of the
-	// target-owned authorization grant that binds a synchronization session to
-	// its approved remote root. Credential material is resolved by External at
-	// dial time and is never persisted in or formatted as a Mutagen URL.
-	ExternalRootGrantIdentifierParameter = "rootGrantId"
+	// MaxExternalEndpointIdentifierBytes is the maximum serialized length of an
+	// opaque External endpoint identifier. It bounds persisted endpoint URLs so
+	// that a malformed or hostile identifier cannot inflate stored state.
+	MaxExternalEndpointIdentifierBytes = 256
 )
 
 // Supported returns whether or not a URL kind is supported.
@@ -111,14 +110,16 @@ func (u *URL) EnsureValid() error {
 			return errors.New("External URL for non-synchronization resource")
 		} else if u.User != "" {
 			return errors.New("External URL with non-empty username")
-		} else if u.Host == "" {
-			return errors.New("External URL with empty machine identifier")
+		} else if err := validateExternalEndpointIdentifier(u.Host); err != nil {
+			return err
 		} else if u.Port != 0 {
 			return errors.New("External URL with non-zero port")
+		} else if u.Path != "" {
+			return errors.New("External URL with path")
 		} else if len(u.Environment) != 0 {
 			return errors.New("External URL with environment variables")
-		} else if len(u.Parameters) != 1 || u.Parameters[ExternalRootGrantIdentifierParameter] == "" {
-			return errors.New("External URL without exactly one root grant parameter")
+		} else if len(u.Parameters) != 0 {
+			return errors.New("External URL with parameters")
 		}
 	} else if u.Protocol == Protocol_Docker {
 		// In the case of Docker, we intentionally avoid validating environment
@@ -137,8 +138,10 @@ func (u *URL) EnsureValid() error {
 
 	// Validate the path component depending on the URL kind.
 	if u.Kind == Kind_Synchronization {
-		// Ensure the path is non-empty.
-		if u.Path == "" {
+		// External URLs carry no path: the endpoint identifier is the URL
+		// authority and the synchronization root is resolved (and enforced)
+		// on the serving side, never persisted in the URL.
+		if u.Protocol != Protocol_External && u.Path == "" {
 			return errors.New("empty path")
 		}
 

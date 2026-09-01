@@ -5,12 +5,12 @@ import (
 	"context"
 	"io"
 	"net"
-	"os"
 	"os/exec"
 	"testing"
 	"time"
 
 	"github.com/mutagen-io/mutagen/pkg/agent"
+	"github.com/mutagen-io/mutagen/pkg/agent/buildtest"
 	"github.com/mutagen-io/mutagen/pkg/mutagen"
 	"github.com/mutagen-io/mutagen/pkg/synchronization"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/endpoint/remote"
@@ -19,6 +19,7 @@ import (
 
 type endpointDialer struct {
 	request  DialRequest
+	root     string
 	serveErr chan error
 }
 
@@ -47,17 +48,13 @@ func (s *processStream) Close() error {
 }
 
 type agentProcessDialer struct {
-	path         string
-	rootOverride string
-	stderr       bytes.Buffer
+	path   string
+	root   string
+	stderr bytes.Buffer
 }
 
-func (d *agentProcessDialer) Dial(_ context.Context, request DialRequest) (io.ReadWriteCloser, error) {
-	root := request.Root
-	if d.rootOverride != "" {
-		root = d.rootOverride
-	}
-	command := exec.Command(d.path, "synchronizer", "--root", root)
+func (d *agentProcessDialer) Dial(_ context.Context, _ DialRequest) (io.ReadWriteCloser, error) {
+	command := exec.Command(d.path, "synchronizer", "--external", "--root", d.root)
 	command.Stderr = &d.stderr
 	stdin, err := command.StdinPipe()
 	if err != nil {
@@ -76,24 +73,15 @@ func (d *agentProcessDialer) Dial(_ context.Context, request DialRequest) (io.Re
 	return &processStream{stdin: stdin, stdout: stdout, cmd: command}, nil
 }
 
-func TestProtocolHandlerRejectsPackagedAgentRootMismatch(t *testing.T) {
-	agentPath := os.Getenv("HAPPIER_MUTAGEN_AGENT_TEST_BINARY")
-	if agentPath == "" {
-		t.Skip("packaged agent test binary not provided")
-	}
-
-	dialer := &agentProcessDialer{path: agentPath, rootOverride: t.TempDir()}
+func TestProtocolHandlerRejectsInvalidPackagedAgentRoot(t *testing.T) {
+	dialer := &agentProcessDialer{path: buildtest.Agent(t), root: t.TempDir() + "/missing"}
 	_, err := NewProtocolHandler(dialer).Connect(
 		context.Background(),
 		nil,
 		&urlpkg.URL{
 			Kind:     urlpkg.Kind_Synchronization,
 			Protocol: urlpkg.Protocol_External,
-			Host:     "machine-01",
-			Path:     t.TempDir(),
-			Parameters: map[string]string{
-				urlpkg.ExternalRootGrantIdentifierParameter: "grant-01",
-			},
+			Host:     "endpoint-01",
 		},
 		"",
 		"sync_session-01",
@@ -102,29 +90,20 @@ func TestProtocolHandlerRejectsPackagedAgentRootMismatch(t *testing.T) {
 		false,
 	)
 	if err == nil {
-		t.Fatal("packaged agent accepted a root outside its target-owned grant")
+		t.Fatal("packaged agent accepted an invalid target-owned root")
 	}
 }
 
 func TestProtocolHandlerConnectsPackagedAgentProcess(t *testing.T) {
-	agentPath := os.Getenv("HAPPIER_MUTAGEN_AGENT_TEST_BINARY")
-	if agentPath == "" {
-		t.Skip("packaged agent test binary not provided")
-	}
-
-	dialer := &agentProcessDialer{path: agentPath}
 	root := t.TempDir()
+	dialer := &agentProcessDialer{path: buildtest.Agent(t), root: root}
 	endpoint, err := NewProtocolHandler(dialer).Connect(
 		context.Background(),
 		nil,
 		&urlpkg.URL{
 			Kind:     urlpkg.Kind_Synchronization,
 			Protocol: urlpkg.Protocol_External,
-			Host:     "machine-01",
-			Path:     root,
-			Parameters: map[string]string{
-				urlpkg.ExternalRootGrantIdentifierParameter: "grant-01",
-			},
+			Host:     "endpoint-01",
 		},
 		"",
 		"sync_session-01",
@@ -159,7 +138,7 @@ func (d *endpointDialer) Dial(_ context.Context, request DialRequest) (io.ReadWr
 			d.serveErr <- err
 			return
 		}
-		d.serveErr <- remote.ServeEndpoint(nil, server)
+		d.serveErr <- remote.ServeEndpointAtRoot(nil, server, d.root)
 	}()
 	return client, nil
 }
@@ -168,17 +147,14 @@ func TestProtocolHandlerConnectsRemoteEndpointThroughDialer(t *testing.T) {
 	dialer := &endpointDialer{}
 	handler := NewProtocolHandler(dialer)
 	root := t.TempDir()
+	dialer.root = root
 	endpoint, err := handler.Connect(
 		context.Background(),
 		nil,
 		&urlpkg.URL{
 			Kind:     urlpkg.Kind_Synchronization,
 			Protocol: urlpkg.Protocol_External,
-			Host:     "machine-01",
-			Path:     root,
-			Parameters: map[string]string{
-				urlpkg.ExternalRootGrantIdentifierParameter: "grant-01",
-			},
+			Host:     "endpoint-01",
 		},
 		"",
 		"sync_session-01",
@@ -190,16 +166,8 @@ func TestProtocolHandlerConnectsRemoteEndpointThroughDialer(t *testing.T) {
 		t.Fatal("unable to connect through External dialer:", err)
 	}
 
-	if dialer.request.MachineIdentifier != "machine-01" {
-		t.Fatal("machine identifier not forwarded to dialer:", dialer.request.MachineIdentifier)
-	} else if dialer.request.RootGrantIdentifier != "grant-01" {
-		t.Fatal("root grant identifier not forwarded to dialer:", dialer.request.RootGrantIdentifier)
-	} else if dialer.request.Root != root {
-		t.Fatal("root not forwarded to dialer:", dialer.request.Root)
-	} else if dialer.request.SessionIdentifier != "sync_session-01" {
-		t.Fatal("session identifier not forwarded to dialer:", dialer.request.SessionIdentifier)
-	} else if dialer.request.Alpha {
-		t.Fatal("endpoint side not forwarded to dialer")
+	if dialer.request.EndpointIdentifier != "endpoint-01" {
+		t.Fatal("opaque endpoint identifier not forwarded to dialer:", dialer.request.EndpointIdentifier)
 	}
 
 	snapshot, err, tryAgain := endpoint.Scan(context.Background(), nil, true)
@@ -249,11 +217,7 @@ func TestProtocolHandlerCancelsStalledAgentHandshake(t *testing.T) {
 			&urlpkg.URL{
 				Kind:     urlpkg.Kind_Synchronization,
 				Protocol: urlpkg.Protocol_External,
-				Host:     "machine-01",
-				Path:     "/workspace",
-				Parameters: map[string]string{
-					urlpkg.ExternalRootGrantIdentifierParameter: "grant-01",
-				},
+				Host:     "endpoint-01",
 			},
 			"",
 			"sync_session-01",
@@ -288,11 +252,7 @@ func TestProtocolHandlerPropagatesDialCancellation(t *testing.T) {
 		&urlpkg.URL{
 			Kind:     urlpkg.Kind_Synchronization,
 			Protocol: urlpkg.Protocol_External,
-			Host:     "machine-01",
-			Path:     "/workspace",
-			Parameters: map[string]string{
-				urlpkg.ExternalRootGrantIdentifierParameter: "grant-01",
-			},
+			Host:     "endpoint-01",
 		},
 		"",
 		"sync_session-01",

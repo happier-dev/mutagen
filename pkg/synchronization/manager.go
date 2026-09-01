@@ -19,7 +19,7 @@ const (
 	// maximumListConflicts is the maximum number of conflicts that will be
 	// reported by Manager.List for a single session before conflict list
 	// truncation for that session.
-	maximumListConflicts = 10
+	maximumListConflicts = 100
 	// maximumListScanProblems is the maximum number of scan problems that will
 	// be reported by Manager.List for a single endpoint in a session before
 	// scan problem list truncation for that endpoint.

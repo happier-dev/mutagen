@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 
 	"google.golang.org/protobuf/proto"
 
@@ -33,10 +35,10 @@ type endpointServer struct {
 	decoder *encoding.ProtobufDecoder
 }
 
-// ServeEndpoint creates and serves a endpoint server on the specified stream.
-// It enforces that the provided stream is closed by the time this function
-// returns, regardless of failure. The provided stream must unblock read and
-// write operations when closed.
+// ServeEndpoint creates and serves an endpoint whose root is selected by the
+// authenticated controller initialization request. This is retained for the
+// existing SSH and Docker transports. Root-confined external transports must
+// use ServeEndpointAtRoot instead.
 func ServeEndpoint(logger *logging.Logger, stream io.ReadWriteCloser) error {
 	return serveEndpoint(logger, stream, "")
 }
@@ -46,16 +48,40 @@ func ServeEndpoint(logger *logging.Logger, stream io.ReadWriteCloser) error {
 // endpoint agent to enforce target-owned path authorization independently of
 // the remote controller's initialization request.
 func ServeEndpointAtRoot(logger *logging.Logger, stream io.ReadWriteCloser, root string) error {
-	if root == "" {
+	root, err := ValidateEndpointRoot(root)
+	if err != nil {
 		stream.Close()
-		return errors.New("empty enforced synchronization root")
+		return err
+	}
+	return serveEndpoint(logger, stream, root)
+}
+
+// ValidateEndpointRoot resolves and validates the target-owned root used by a
+// rooted agent. It rejects missing, inaccessible, non-directory, and symlink
+// roots before any protocol handshake and returns the canonical real path.
+func ValidateEndpointRoot(root string) (string, error) {
+	if root == "" {
+		return "", errors.New("empty enforced synchronization root")
 	}
 	normalizedRoot, err := filesystem.Normalize(root)
 	if err != nil {
-		stream.Close()
-		return fmt.Errorf("unable to normalize enforced synchronization root: %w", err)
+		return "", fmt.Errorf("unable to normalize enforced synchronization root: %w", err)
 	}
-	return serveEndpoint(logger, stream, normalizedRoot)
+	metadata, err := os.Lstat(normalizedRoot)
+	if err != nil {
+		return "", fmt.Errorf("unable to inspect enforced synchronization root: %w", err)
+	}
+	if metadata.Mode()&os.ModeSymlink != 0 {
+		return "", errors.New("enforced synchronization root must not be a symbolic link")
+	}
+	if !metadata.IsDir() {
+		return "", errors.New("enforced synchronization root must be a directory")
+	}
+	realRoot, err := filepath.EvalSymlinks(normalizedRoot)
+	if err != nil {
+		return "", fmt.Errorf("unable to resolve enforced synchronization root: %w", err)
+	}
+	return filesystem.Normalize(realRoot)
 }
 
 func serveEndpoint(logger *logging.Logger, stream io.ReadWriteCloser, enforcedRoot string) error {
@@ -105,6 +131,13 @@ func serveEndpoint(logger *logging.Logger, stream io.ReadWriteCloser, enforcedRo
 		encoder.Encode(&InitializeSynchronizationResponse{Error: err.Error()})
 		flusher.Flush()
 		return err
+	}
+
+	// A rooted agent owns root selection. External clients deliberately send no
+	// root, so substitute the already validated target root before applying the
+	// ordinary request invariants. A non-empty caller root must match exactly.
+	if enforcedRoot != "" && request.Root == "" {
+		request.Root = enforcedRoot
 	}
 
 	// Ensure that the initialization request is valid.

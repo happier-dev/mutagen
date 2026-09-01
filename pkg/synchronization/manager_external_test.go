@@ -14,11 +14,7 @@ func TestManagerReloadsPersistedExternalEndpoint(t *testing.T) {
 	alpha := &url.URL{Path: filepath.Join(t.TempDir(), "alpha")}
 	beta := &url.URL{
 		Protocol: url.Protocol_External,
-		Host:     "machine-01",
-		Path:     `C:\Users\alice\workspace`,
-		Parameters: map[string]string{
-			url.ExternalRootGrantIdentifierParameter: "grant-01",
-		},
+		Host:     "endpoint-01",
 	}
 
 	manager, err := NewManager(nil)

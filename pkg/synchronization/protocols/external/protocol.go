@@ -16,15 +16,11 @@ import (
 	urlpkg "github.com/mutagen-io/mutagen/pkg/url"
 )
 
-// DialRequest contains the authority and endpoint metadata that the external transport needs
-// to establish a stream. Carrier selection deliberately does not appear here:
-// the transport owns direct-versus-relay routing behind this contract.
+// DialRequest contains the only datum that the generic external transport may
+// receive. The identifier is opaque: authorization, route selection, and root
+// resolution are owned by the embedding transport at connection time.
 type DialRequest struct {
-	MachineIdentifier   string
-	RootGrantIdentifier string
-	Root                string
-	SessionIdentifier   string
-	Alpha               bool
+	EndpointIdentifier string
 }
 
 // StreamDialer establishes an authenticated, full-duplex stream to an external
@@ -65,11 +61,7 @@ func (h *protocolHandler) Connect(
 	}
 
 	stream, err := h.dialer.Dial(ctx, DialRequest{
-		MachineIdentifier:   url.Host,
-		RootGrantIdentifier: url.Parameters[urlpkg.ExternalRootGrantIdentifierParameter],
-		Root:                url.Path,
-		SessionIdentifier:   session,
-		Alpha:               alpha,
+		EndpointIdentifier: url.Host,
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -93,7 +85,9 @@ func (h *protocolHandler) Connect(
 		return nil, fmt.Errorf("External synchronization agent version handshake failed: %w", err)
 	}
 
-	endpoint, err := remote.NewEndpoint(logger, stream, url.Path, session, version, configuration, alpha)
+	// External endpoint URLs intentionally contain no root. The target-owned
+	// agent substitutes and revalidates its explicit --root before serving.
+	endpoint, err := remote.NewEndpoint(logger, stream, "", session, version, configuration, alpha)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()

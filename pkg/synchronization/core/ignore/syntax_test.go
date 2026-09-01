@@ -1,8 +1,26 @@
 package ignore
 
-import (
-	"testing"
-)
+import "testing"
+
+func TestGitWorktreeSyntaxIsExplicitAndSupported(t *testing.T) {
+	if !Syntax_SyntaxGitWorktree.Supported() {
+		t.Fatal("Git worktree selection syntax is not supported")
+	}
+	encoded, err := Syntax_SyntaxGitWorktree.MarshalText()
+	if err != nil {
+		t.Fatal("unable to marshal Git worktree syntax:", err)
+	}
+	if string(encoded) != "git-worktree" {
+		t.Fatalf("unexpected Git worktree syntax encoding: %q", encoded)
+	}
+	var decoded Syntax
+	if err := decoded.UnmarshalText(encoded); err != nil {
+		t.Fatal("unable to unmarshal Git worktree syntax:", err)
+	}
+	if decoded != Syntax_SyntaxGitWorktree {
+		t.Fatalf("Git worktree syntax round trip mismatch: %v", decoded)
+	}
+}
 
 // TestSyntaxIsDefault tests Syntax.IsDefault.
 func TestSyntaxIsDefault(t *testing.T) {
@@ -15,7 +33,8 @@ func TestSyntaxIsDefault(t *testing.T) {
 		{Syntax_SyntaxDefault, true},
 		{Syntax_SyntaxMutagen, false},
 		{Syntax_SyntaxDocker, false},
-		{Syntax_SyntaxDocker + 1, false},
+		{Syntax_SyntaxGitWorktree, false},
+		{Syntax_SyntaxGitWorktree + 1, false},
 	}
 
 	// Process test cases.
@@ -40,6 +59,7 @@ func TestSyntaxUnmarshalText(t *testing.T) {
 		{"asdf", Syntax_SyntaxDefault, true},
 		{"mutagen", Syntax_SyntaxMutagen, false},
 		{"docker", Syntax_SyntaxDocker, false},
+		{"git-worktree", Syntax_SyntaxGitWorktree, false},
 	}
 
 	// Process test cases.
@@ -71,7 +91,8 @@ func TestSyntaxSupported(t *testing.T) {
 		{Syntax_SyntaxDefault, false},
 		{Syntax_SyntaxMutagen, true},
 		{Syntax_SyntaxDocker, true},
-		{(Syntax_SyntaxDocker + 1), false},
+		{Syntax_SyntaxGitWorktree, true},
+		{(Syntax_SyntaxGitWorktree + 1), false},
 	}
 
 	// Process test cases.
@@ -96,7 +117,8 @@ func TestSyntaxDescription(t *testing.T) {
 		{Syntax_SyntaxDefault, "Default"},
 		{Syntax_SyntaxMutagen, "Mutagen"},
 		{Syntax_SyntaxDocker, "Docker"},
-		{(Syntax_SyntaxDocker + 1), "Unknown"},
+		{Syntax_SyntaxGitWorktree, "Git worktree"},
+		{(Syntax_SyntaxGitWorktree + 1), "Unknown"},
 	}
 
 	// Process test cases.

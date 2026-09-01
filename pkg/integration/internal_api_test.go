@@ -257,7 +257,9 @@ func TestSynchronizationGOROOTSrcToBetaInMemory(t *testing.T) {
 	for _, configuration := range testCases {
 		// Calculate alpha and beta paths.
 		alphaRoot := sourceRoot
-		betaRoot := filepath.Join(t.TempDir(), "beta")
+		// The netpipe transport models a rooted target agent, so give it an
+		// explicitly authorized existing temporary root.
+		betaRoot := t.TempDir()
 
 		// Compute alpha and beta URLs. We use a special protocol with a custom
 		// handler to indicate an in-memory connection.

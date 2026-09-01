@@ -59,6 +59,15 @@ func (h *synchronizationProtocolHandler) Connect(
 		panic("non-netpipe URL dispatched to netpipe protocol handler")
 	}
 
+	// The in-memory transport is a test-only stand-in for a target agent, but
+	// it must obey the same target-owned root contract. Authorize the exact
+	// existing directory before opening the stream instead of retaining an
+	// unrooted endpoint-server entry point for the harness.
+	authorizedRoot, err := remote.ValidateEndpointRoot(url.Path)
+	if err != nil {
+		return nil, fmt.Errorf("unable to authorize in-memory endpoint root: %w", err)
+	}
+
 	// Create an in-memory network connection.
 	clientConnection, serverConnection := net.Pipe()
 
@@ -67,7 +76,7 @@ func (h *synchronizationProtocolHandler) Connect(
 	// we can block on it in our endpoint wrapper.
 	remoteEndpointDone := make(chan struct{})
 	go func() {
-		remote.ServeEndpoint(logger.Sublogger("remote"), serverConnection)
+		remote.ServeEndpointAtRoot(logger.Sublogger("remote"), serverConnection, authorizedRoot)
 		close(remoteEndpointDone)
 	}()
 

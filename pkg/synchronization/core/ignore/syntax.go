@@ -18,6 +18,8 @@ func (s Syntax) MarshalText() ([]byte, error) {
 		result = "mutagen"
 	case Syntax_SyntaxDocker:
 		result = "docker"
+	case Syntax_SyntaxGitWorktree:
+		result = "git-worktree"
 	default:
 		result = "unknown"
 	}
@@ -35,6 +37,8 @@ func (s *Syntax) UnmarshalText(textBytes []byte) error {
 		*s = Syntax_SyntaxMutagen
 	case "docker":
 		*s = Syntax_SyntaxDocker
+	case "git-worktree":
+		*s = Syntax_SyntaxGitWorktree
 	default:
 		return fmt.Errorf("unknown ignore syntax specification: %s", text)
 	}
@@ -51,6 +55,8 @@ func (s Syntax) Supported() bool {
 		return true
 	case Syntax_SyntaxDocker:
 		return true
+	case Syntax_SyntaxGitWorktree:
+		return true
 	default:
 		return false
 	}
@@ -65,6 +71,8 @@ func (s Syntax) Description() string {
 		return "Mutagen"
 	case Syntax_SyntaxDocker:
 		return "Docker"
+	case Syntax_SyntaxGitWorktree:
+		return "Git worktree"
 	default:
 		return "Unknown"
 	}

@@ -43,25 +43,21 @@ func (s *countingStream) Write(buffer []byte) (int, error) {
 }
 
 type authorizedEndpointDialer struct {
-	machineIdentifier string
-	roots             map[string]string
-	bytesRead         atomic.Uint64
-	bytesWritten      atomic.Uint64
-	dialCount         atomic.Uint64
-	lock              sync.Mutex
-	active            []io.Closer
+	roots        map[string]string
+	bytesRead    atomic.Uint64
+	bytesWritten atomic.Uint64
+	dialCount    atomic.Uint64
+	lock         sync.Mutex
+	active       []io.Closer
 }
 
 func (d *authorizedEndpointDialer) Dial(
 	_ context.Context,
 	request externalprotocol.DialRequest,
 ) (io.ReadWriteCloser, error) {
-	if request.MachineIdentifier != d.machineIdentifier {
-		return nil, errors.New("unauthorized machine")
-	}
-	root, ok := d.roots[request.RootGrantIdentifier]
-	if !ok || request.Root != root {
-		return nil, errors.New("root is not authorized by grant")
+	root, ok := d.roots[request.EndpointIdentifier]
+	if !ok {
+		return nil, errors.New("unknown opaque endpoint")
 	}
 
 	client, server := net.Pipe()
@@ -77,7 +73,7 @@ func (d *authorizedEndpointDialer) Dial(
 			server.Close()
 			return
 		}
-		remote.ServeEndpoint(nil, server)
+		remote.ServeEndpointAtRoot(nil, server, root)
 	}()
 
 	return &countingStream{
@@ -149,7 +145,7 @@ func waitForConnectedSession(
 
 func createExternalSession(
 	t *testing.T,
-	alphaRoot, betaRoot, rootGrantIdentifier string,
+	alphaRoot, betaRoot, endpointIdentifier string,
 	mode core.SynchronizationMode,
 ) string {
 	t.Helper()
@@ -160,11 +156,7 @@ func createExternalSession(
 		&url.URL{Path: alphaRoot},
 		&url.URL{
 			Protocol: url.Protocol_External,
-			Host:     "machine-beta",
-			Path:     betaRoot,
-			Parameters: map[string]string{
-				url.ExternalRootGrantIdentifierParameter: rootGrantIdentifier,
-			},
+			Host:     endpointIdentifier,
 		},
 		&synchronization.Configuration{
 			SynchronizationMode:  mode,
@@ -209,7 +201,6 @@ func TestSynchronizationThroughExternalTransport(t *testing.T) {
 	}
 
 	dialer := &authorizedEndpointDialer{
-		machineIdentifier: "machine-beta",
 		roots: map[string]string{
 			"one-way-root": oneWayBeta,
 			"two-way-root": twoWayBeta,

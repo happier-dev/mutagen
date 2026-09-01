@@ -24,6 +24,7 @@ import (
 	dockerignore "github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore/docker"
 	mutagenignore "github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore/mutagen"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/endpoint/local/staging"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/gitworktree"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/rsync"
 	"github.com/mutagen-io/mutagen/pkg/timeutil"
 )
@@ -162,6 +163,9 @@ type endpoint struct {
 	cache *core.Cache
 	// ignorer is the ignorer to use for scans.
 	ignorer ignore.Ignorer
+	// gitWorktreeIgnorer is non-nil when endpoint-local Git worktree policy is
+	// active. It is refreshed once at each scanner cycle boundary.
+	gitWorktreeIgnorer *gitworktree.Ignorer
 	// ignoreCache is the ignore cache from the last successful scan on the
 	// endpoint.
 	ignoreCache ignore.IgnoreCache
@@ -286,7 +290,23 @@ func NewEndpoint(
 	ignores = append(ignores, configuration.DefaultIgnores...)
 	ignores = append(ignores, configuration.Ignores...)
 	var ignorer ignore.Ignorer
-	if ignoreSyntax == ignore.Syntax_SyntaxMutagen {
+	var gitWorktreeIgnorer *gitworktree.Ignorer
+	if ignoreSyntax == ignore.Syntax_SyntaxGitWorktree {
+		var extraIgnores, extraIncludes []string
+		for _, pattern := range ignores {
+			if strings.HasPrefix(pattern, "!") {
+				extraIncludes = append(extraIncludes, strings.TrimPrefix(pattern, "!"))
+			} else {
+				extraIgnores = append(extraIgnores, pattern)
+			}
+		}
+		var err error
+		gitWorktreeIgnorer, err = gitworktree.NewIgnorer(root, extraIgnores, extraIncludes)
+		if err != nil {
+			return nil, err
+		}
+		ignorer = gitWorktreeIgnorer
+	} else if ignoreSyntax == ignore.Syntax_SyntaxMutagen {
 		if i, err := mutagenignore.NewIgnorer(ignores); err != nil {
 			return nil, fmt.Errorf("unable to create Mutagen-style ignorer: %w", err)
 		} else {
@@ -307,7 +327,7 @@ func NewEndpoint(
 	if ignoreVCSMode.IsDefault() {
 		ignoreVCSMode = version.DefaultIgnoreVCSMode()
 	}
-	if ignoreVCSMode == ignore.IgnoreVCSMode_IgnoreVCSModeIgnore {
+	if gitWorktreeIgnorer == nil && ignoreVCSMode == ignore.IgnoreVCSMode_IgnoreVCSModeIgnore {
 		ignorer = ignore.IgnoreVCS(ignorer)
 	}
 
@@ -483,6 +503,7 @@ func NewEndpoint(
 		hasher:                       hasherFactory(),
 		cache:                        cache,
 		ignorer:                      ignorer,
+		gitWorktreeIgnorer:           gitWorktreeIgnorer,
 		stager: staging.NewStager(
 			stagingRoot,
 			hideStagingRoot,
@@ -1000,6 +1021,12 @@ func (e *endpoint) Poll(ctx context.Context) error {
 // scan is the internal function which performs a scan operation on the root and
 // updates the endpoint scan parameters. The caller must hold the scan lock.
 func (e *endpoint) scan(ctx context.Context, baseline *core.Snapshot, recheckPaths map[string]bool) error {
+	if e.gitWorktreeIgnorer != nil {
+		if err := e.gitWorktreeIgnorer.Refresh(); err != nil {
+			return err
+		}
+		e.ignoreCache = nil
+	}
 	// Perform a full (warm) scan, watching for errors.
 	snapshot, newCache, newIgnoreCache, err := core.Scan(
 		ctx,
@@ -1013,6 +1040,11 @@ func (e *endpoint) scan(ctx context.Context, baseline *core.Snapshot, recheckPat
 	)
 	if err != nil {
 		return err
+	}
+	if e.gitWorktreeIgnorer != nil {
+		if err := e.gitWorktreeIgnorer.SelectionError(); err != nil {
+			return err
+		}
 	}
 
 	// Update the snapshot.
@@ -1449,6 +1481,11 @@ func (e *endpoint) Shutdown() error {
 
 	// Terminate the polling coalescer.
 	e.pollSignal.Terminate()
+
+	// Release the endpoint-local Git ignore oracle, if one is active.
+	if e.gitWorktreeIgnorer != nil {
+		e.gitWorktreeIgnorer.Close()
+	}
 
 	// Done.
 	return nil
