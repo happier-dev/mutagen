@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"os/user"
 	"testing"
 	"time"
@@ -22,7 +23,7 @@ func TestDialBrokerEndpointConsumesRawNamedPipePath(t *testing.T) {
 	pipeName := fmt.Sprintf(`\\.\pipe\happier-workspace-sync-test-%s`, uuid.NewString())
 	listener, err := winio.ListenPipe(pipeName, &winio.PipeConfig{
 		SecurityDescriptor: fmt.Sprintf("D:P(A;;GA;;;%s)", current.Uid),
-		MessageMode:        true,
+		MessageMode:        false,
 	})
 	if err != nil {
 		t.Fatalf("listen on raw pipe path: %v", err)
@@ -40,17 +41,34 @@ func TestDialBrokerEndpointConsumesRawNamedPipePath(t *testing.T) {
 		t.Fatalf("dial raw pipe path: %v", err)
 	}
 	defer client.Close()
-	server := <-accepted
+	var server acceptedConnection
+	select {
+	case server = <-accepted:
+	case <-ctx.Done():
+		t.Fatal("accept raw pipe connection:", ctx.Err())
+	}
 	if server.err != nil {
 		t.Fatalf("accept raw pipe connection: %v", server.err)
 	}
 	defer server.connection.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	if err := client.SetDeadline(deadline); err != nil {
+		t.Fatalf("bound client pipe operations: %v", err)
+	}
+	if err := server.connection.SetDeadline(deadline); err != nil {
+		t.Fatalf("bound server pipe operations: %v", err)
+	}
 	payload := []byte("raw-workspace-pipe")
+	received := make([]byte, len(payload))
+	readResult := make(chan error, 1)
+	go func() {
+		_, readErr := io.ReadFull(server.connection, received)
+		readResult <- readErr
+	}()
 	if _, err := client.Write(payload); err != nil {
 		t.Fatalf("write raw pipe payload: %v", err)
 	}
-	received := make([]byte, len(payload))
-	if _, err := io.ReadFull(server.connection, received); err != nil {
+	if err := <-readResult; err != nil {
 		t.Fatalf("read raw pipe payload: %v", err)
 	}
 	if string(received) != string(payload) {
@@ -59,6 +77,6 @@ func TestDialBrokerEndpointConsumesRawNamedPipePath(t *testing.T) {
 }
 
 type acceptedConnection struct {
-	connection io.ReadWriteCloser
+	connection net.Conn
 	err        error
 }

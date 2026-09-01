@@ -148,16 +148,19 @@ func TestIgnorerPreservesNULTerminatedPathBytes(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("*.secret\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// Windows rejects LF in file names. Use a legal Unicode line separator,
+	// along with leading and embedded spaces, to retain the cross-platform
+	// assertion that Git's NUL-delimited oracle preserves exact path bytes.
 	paths := []string{
 		" leading tracked.txt",
-		"trailing tracked.txt ",
-		"line\nbreak.secret",
-		"line\nbreak.txt",
+		"tracked name with spaces.txt",
+		"line\u2028separator.secret",
+		"line\u2028separator.txt",
 	}
 	for _, path := range paths {
 		writeFixtureFile(t, root, path)
 	}
-	runGit(t, root, "add", " leading tracked.txt", "trailing tracked.txt ")
+	runGit(t, root, "add", " leading tracked.txt", "tracked name with spaces.txt")
 	assertMatchesGitSelection(t, root, paths...)
 }
 

@@ -80,11 +80,13 @@ func (h *synchronizationProtocolHandler) Connect(
 		close(remoteEndpointDone)
 	}()
 
-	// Create a client for this endpoint.
+	// Create a client for this endpoint. Use the same canonical path that the
+	// test agent authorized so platform aliases (for example /var and
+	// /private/var on macOS) don't manufacture a root mismatch.
 	endpoint, err := remote.NewEndpoint(
 		logger,
 		clientConnection,
-		url.Path,
+		authorizedRoot,
 		session,
 		version,
 		configuration,

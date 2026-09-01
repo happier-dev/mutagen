@@ -28,6 +28,7 @@ func TestHappierReleasePreservesMixedLicenseBuildContract(t *testing.T) {
 	provenance := string(provenanceBytes)
 
 	for _, required := range []string{
+		"MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}",
 		"mutagensidecar,mutagensspl",
 		"mutagenagent,mutagensspl",
 		"watcher: polling",
@@ -47,6 +48,7 @@ func TestHappierReleasePreservesMixedLicenseBuildContract(t *testing.T) {
 	}
 
 	for _, forbidden := range []string{
+		"MUTAGEN_RELEASE_MINISIGN_SECRET_KEY",
 		"mutagenfanotify",
 		"runner: macos-13",
 		`manager_sha="$(shasum`,

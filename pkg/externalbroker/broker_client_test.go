@@ -12,12 +12,25 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	externalprotocol "github.com/mutagen-io/mutagen/pkg/synchronization/protocols/external"
 )
+
+const brokerTestOperationTimeout = 5 * time.Second
+
+func shortUnixSocketPath(t *testing.T, name string) string {
+	t.Helper()
+	directory, err := os.MkdirTemp("", "mutagen-broker-")
+	if err != nil {
+		t.Fatal("unable to create short broker socket directory:", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(directory) })
+	return filepath.Join(directory, name)
+}
 
 func TestReadBrokerDescriptorRejectsTrailingJSON(t *testing.T) {
 	secret := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
@@ -29,7 +42,7 @@ func TestReadBrokerDescriptorRejectsTrailingJSON(t *testing.T) {
 
 func TestBrokerDescriptorBootstrapConnectsIPCAndReturnsTypedError(t *testing.T) {
 	secret := bytes.Repeat([]byte{7}, 32)
-	endpoint := filepath.Join(t.TempDir(), "control.sock")
+	endpoint := shortUnixSocketPath(t, "control.sock")
 	descriptor := BrokerDescriptor{
 		Protocol: BrokerProtocolVersion, BrokerEndpoint: endpoint,
 		BrokerInstanceID: "broker-01", LaunchNonce: "nonce-01",
@@ -48,6 +61,10 @@ func TestBrokerDescriptorBootstrapConnectsIPCAndReturnsTypedError(t *testing.T) 
 		t.Fatal("unable to listen on broker endpoint:", err)
 	}
 	defer listener.Close()
+	deadline := time.Now().Add(brokerTestOperationTimeout)
+	if err := listener.(*net.UnixListener).SetDeadline(deadline); err != nil {
+		t.Fatal("unable to bound broker accept:", err)
+	}
 	brokerFailure := make(chan error, 1)
 	go func() {
 		connection, err := listener.Accept()
@@ -56,6 +73,10 @@ func TestBrokerDescriptorBootstrapConnectsIPCAndReturnsTypedError(t *testing.T) 
 			return
 		}
 		defer connection.Close()
+		if err := connection.SetDeadline(deadline); err != nil {
+			brokerFailure <- err
+			return
+		}
 		reader := bufio.NewReader(connection)
 		raw, err := readControlFrame(reader)
 		if err != nil {
@@ -93,7 +114,9 @@ func TestBrokerDescriptorBootstrapConnectsIPCAndReturnsTypedError(t *testing.T) 
 		}
 		brokerFailure <- nil
 	}()
-	client, err := NewBrokerClient(context.Background(), parsed)
+	clientContext, cancelClient := context.WithTimeout(context.Background(), brokerTestOperationTimeout)
+	defer cancelClient()
+	client, err := NewBrokerClient(clientContext, parsed)
 	if err != nil {
 		t.Fatal("unable to connect authenticated IPC client:", err)
 	}
@@ -113,7 +136,7 @@ func TestBrokerDescriptorBootstrapConnectsIPCAndReturnsTypedError(t *testing.T) 
 func TestBrokerClientCancelsOneCommandWithoutClosingControl(t *testing.T) {
 	secret := bytes.Repeat([]byte{9}, 32)
 	descriptor := BrokerDescriptor{
-		Protocol: BrokerProtocolVersion, BrokerEndpoint: filepath.Join(t.TempDir(), "control.sock"),
+		Protocol: BrokerProtocolVersion, BrokerEndpoint: shortUnixSocketPath(t, "control.sock"),
 		BrokerInstanceID: "broker-01", LaunchNonce: "nonce-01",
 		Secret: base64.RawURLEncoding.EncodeToString(secret),
 	}
@@ -201,7 +224,7 @@ func TestBrokerClientCancelsOneCommandWithoutClosingControl(t *testing.T) {
 func TestBrokerClientDrainsLateResponseAfterCancelledPendingRequest(t *testing.T) {
 	secret := bytes.Repeat([]byte{11}, 32)
 	descriptor := BrokerDescriptor{
-		Protocol: BrokerProtocolVersion, BrokerEndpoint: filepath.Join(t.TempDir(), "control.sock"),
+		Protocol: BrokerProtocolVersion, BrokerEndpoint: shortUnixSocketPath(t, "control.sock"),
 		BrokerInstanceID: "broker-01", LaunchNonce: "nonce-01",
 		Secret: base64.RawURLEncoding.EncodeToString(secret),
 	}
@@ -308,12 +331,20 @@ func TestBrokerClientOpensSeparateRawDataStream(t *testing.T) {
 	}
 	descriptor := BrokerDescriptor{
 		Protocol:         BrokerProtocolVersion,
-		BrokerEndpoint:   filepath.Join(t.TempDir(), "control.sock"),
+		BrokerEndpoint:   shortUnixSocketPath(t, "control.sock"),
 		BrokerInstanceID: "broker-01",
 		LaunchNonce:      "nonce-01",
 		Secret:           base64.RawURLEncoding.EncodeToString(secret),
 	}
 	clientControl, brokerControl := net.Pipe()
+	deadline := time.Now().Add(brokerTestOperationTimeout)
+	if err := clientControl.SetDeadline(deadline); err != nil {
+		t.Fatal("unable to bound client control operations:", err)
+	}
+	if err := brokerControl.SetDeadline(deadline); err != nil {
+		t.Fatal("unable to bound broker control operations:", err)
+	}
+	dataEndpoint := shortUnixSocketPath(t, "data.sock")
 	brokerFailure := make(chan error, 1)
 	go func() {
 		reader := bufio.NewReader(brokerControl)
@@ -351,16 +382,19 @@ func TestBrokerClientOpensSeparateRawDataStream(t *testing.T) {
 			brokerFailure <- io.ErrUnexpectedEOF
 			return
 		}
-		endpoint := filepath.Join(t.TempDir(), "data.sock")
-		listener, err := net.Listen("unix", endpoint)
+		listener, err := net.Listen("unix", dataEndpoint)
 		if err != nil {
 			brokerFailure <- err
 			return
 		}
 		defer listener.Close()
+		if err := listener.(*net.UnixListener).SetDeadline(deadline); err != nil {
+			brokerFailure <- err
+			return
+		}
 		if err := writeTestFrame(brokerControl, dataReady{
 			T: "data_ready", RequestID: open.RequestID, StreamID: "stream-01",
-			DataEndpoint: endpoint, AttachNonce: "attach-01", ExpiresAtMS: time.Now().Add(time.Minute).UnixMilli(),
+			DataEndpoint: dataEndpoint, AttachNonce: "attach-01", ExpiresAtMS: time.Now().Add(time.Minute).UnixMilli(),
 		}); err != nil {
 			brokerFailure <- err
 			return
@@ -398,7 +432,9 @@ func TestBrokerClientOpensSeparateRawDataStream(t *testing.T) {
 		t.Fatal("unable to authenticate broker client:", err)
 	}
 	defer client.Close()
-	stream, err := client.Dial(context.Background(), externalprotocol.DialRequest{EndpointIdentifier: "endpoint-01"})
+	dialContext, cancelDial := context.WithTimeout(context.Background(), brokerTestOperationTimeout)
+	defer cancelDial()
+	stream, err := client.Dial(dialContext, externalprotocol.DialRequest{EndpointIdentifier: "endpoint-01"})
 	if err != nil {
 		t.Fatal("unable to open external data stream:", err)
 	}
@@ -418,11 +454,19 @@ func TestBrokerClientOpensSeparateRawDataStream(t *testing.T) {
 func TestBrokerClientKeepsControlAfterAttachFailureUsesOriginalRequestID(t *testing.T) {
 	secret := bytes.Repeat([]byte{13}, 32)
 	descriptor := BrokerDescriptor{
-		Protocol: BrokerProtocolVersion, BrokerEndpoint: filepath.Join(t.TempDir(), "control.sock"),
+		Protocol: BrokerProtocolVersion, BrokerEndpoint: shortUnixSocketPath(t, "control.sock"),
 		BrokerInstanceID: "broker-01", LaunchNonce: "nonce-01",
 		Secret: base64.RawURLEncoding.EncodeToString(secret),
 	}
 	clientControl, brokerControl := net.Pipe()
+	deadline := time.Now().Add(brokerTestOperationTimeout)
+	if err := clientControl.SetDeadline(deadline); err != nil {
+		t.Fatal("unable to bound client control operations:", err)
+	}
+	if err := brokerControl.SetDeadline(deadline); err != nil {
+		t.Fatal("unable to bound broker control operations:", err)
+	}
+	dataEndpoint := shortUnixSocketPath(t, "data.sock")
 	brokerFailure := make(chan error, 1)
 	go func() {
 		reader := bufio.NewReader(brokerControl)
@@ -454,13 +498,16 @@ func TestBrokerClientKeepsControlAfterAttachFailureUsesOriginalRequestID(t *test
 			brokerFailure <- io.ErrUnexpectedEOF
 			return
 		}
-		dataEndpoint := filepath.Join(t.TempDir(), "data.sock")
 		listener, err := net.Listen("unix", dataEndpoint)
 		if err != nil {
 			brokerFailure <- err
 			return
 		}
 		defer listener.Close()
+		if err := listener.(*net.UnixListener).SetDeadline(deadline); err != nil {
+			brokerFailure <- err
+			return
+		}
 		if err := writeTestFrame(brokerControl, dataReady{
 			T: "data_ready", RequestID: open.RequestID, StreamID: "stream-01",
 			DataEndpoint: dataEndpoint, AttachNonce: "attach-01", ExpiresAtMS: time.Now().Add(time.Minute).UnixMilli(),
@@ -511,7 +558,9 @@ func TestBrokerClientKeepsControlAfterAttachFailureUsesOriginalRequestID(t *test
 		t.Fatal("unable to authenticate broker client:", err)
 	}
 	defer client.Close()
-	if _, err := client.Dial(context.Background(), externalprotocol.DialRequest{EndpointIdentifier: "endpoint-01"}); err == nil {
+	dialContext, cancelDial := context.WithTimeout(context.Background(), brokerTestOperationTimeout)
+	defer cancelDial()
+	if _, err := client.Dial(dialContext, externalprotocol.DialRequest{EndpointIdentifier: "endpoint-01"}); err == nil {
 		t.Fatal("data attach failure was reported as success")
 	}
 	response, err := client.request(context.Background(), "next-request", map[string]any{

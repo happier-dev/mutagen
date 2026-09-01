@@ -173,7 +173,7 @@ jobs:
           git archive --format=tar.gz --prefix="happier-mutagen-${GITHUB_REF_NAME}/" --output="dist/happier-mutagen-source-${GITHUB_REF_NAME}.tar.gz" "${GITHUB_REF_NAME}"
       - name: Sign aggregate checksums
         env:
-          MINISIGN_SECRET_KEY: ${{ secrets.MUTAGEN_RELEASE_MINISIGN_SECRET_KEY }}
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
         run: |
           set -euo pipefail
           test -n "${MINISIGN_SECRET_KEY}"
