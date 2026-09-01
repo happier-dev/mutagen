@@ -41,6 +41,13 @@ func TestHappierReleasePreservesMixedLicenseBuildContract(t *testing.T) {
 		`"sourceTag":"${GITHUB_REF_NAME}"`,
 		"git archive",
 		"go run -tags mutagensspl ./scripts/ci/print_licenses",
+		`windows-amd64) executable_suffix=".exe"`,
+		`manager_relative_path="bin/happier-mutagen${executable_suffix}"`,
+		`agent_relative_path="bin/happier-mutagen-agent${executable_suffix}"`,
+		`-o "${root}/${manager_relative_path}"`,
+		`-o "${root}/${agent_relative_path}"`,
+		`"managerPath":"${manager_relative_path}"`,
+		`"agentPath":"${agent_relative_path}"`,
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Errorf("Happier release workflow is missing %q", required)

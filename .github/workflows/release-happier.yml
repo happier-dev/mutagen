@@ -107,8 +107,14 @@ jobs:
           agent_tags="mutagenagent,mutagensspl"
           build_tags_json='["mutagensidecar","mutagensspl","mutagenagent"]'
           agent_tags_json='["mutagenagent","mutagensspl"]'
-          go build -trimpath -ldflags "${ldflags}" -tags "${manager_tags}" -o "${root}/bin/happier-mutagen" ./cmd/mutagen-sidecar
-          go build -trimpath -ldflags "${ldflags}" -tags "${agent_tags}" -o "${root}/bin/happier-mutagen-agent" ./cmd/mutagen-agent
+          case "${{ matrix.target }}" in
+            windows-amd64) executable_suffix=".exe" ;;
+            *) executable_suffix="" ;;
+          esac
+          manager_relative_path="bin/happier-mutagen${executable_suffix}"
+          agent_relative_path="bin/happier-mutagen-agent${executable_suffix}"
+          go build -trimpath -ldflags "${ldflags}" -tags "${manager_tags}" -o "${root}/${manager_relative_path}" ./cmd/mutagen-sidecar
+          go build -trimpath -ldflags "${ldflags}" -tags "${agent_tags}" -o "${root}/${agent_relative_path}" ./cmd/mutagen-agent
           cp LICENSE "${root}/licenses/MUTAGEN-LICENSE"
           cp sspl/LICENSE "${root}/licenses/SSPL-LICENSE"
           # Mutagen's build-tag-aware canonical license registry includes its
@@ -121,8 +127,8 @@ jobs:
               shasum -a 256 "$1" | awk '{print $1}'
             fi
           }
-          manager_sha="$(sha256_file "${root}/bin/happier-mutagen")"
-          agent_sha="$(sha256_file "${root}/bin/happier-mutagen-agent")"
+          manager_sha="$(sha256_file "${root}/${manager_relative_path}")"
+          agent_sha="$(sha256_file "${root}/${agent_relative_path}")"
           fork_commit="$(git rev-parse HEAD)"
           case "${{ matrix.target }}" in
             darwin-arm64) go_checksum=416c35218edb9d20990b5d8fc87be655d8b39926f15524ea35c66ee70273050d ;;
@@ -132,7 +138,7 @@ jobs:
             windows-amd64) go_checksum=2ceda04074eac51f4b0b85a9fcca38bcd49daee24bed9ea1f29958a8e22673a6 ;;
           esac
           cat > "${root}/.happier-mutagen-engine.json" <<EOF
-          {"format":"happier-mutagen-engine","schemaVersion":1,"component":"mutagen-engine","engineVersion":"${GITHUB_REF_NAME#mutagen-v}","forkCommit":"${fork_commit}","forkBranch":"happier/external-stream-v1","sourceRepository":"https://github.com/happier-dev/mutagen","sourceTag":"${GITHUB_REF_NAME}","sourceArchive":"happier-mutagen-source-${GITHUB_REF_NAME}.tar.gz","transportSpikeCommit":"cd8069cf8b945dfa0d0f47d8685322c6f1e16e44","upstreamTag":"v0.18.1","upstreamCommit":"a225ae50aee3d7ebb59139203cb84e8a6a3ff4bf","toolchain":{"go":"1.22.12","goChecksum":"${go_checksum}"},"protocolEpoch":"external-stream-v1","targetTriple":"${{ matrix.target }}","managerPath":"bin/happier-mutagen","agentPath":"bin/happier-mutagen-agent","licensePolicy":"mixed-mit-sspl","ssplEnabled":true,"buildTags":${build_tags_json},"managerBuildTags":["mutagensidecar","mutagensspl"],"agentBuildTags":${agent_tags_json},"cgoEnabled":${{ matrix.cgo == '1' }},"watcher":"${{ matrix.watcher }}","releaseTag":"${GITHUB_REF_NAME}","managerSha256":"${manager_sha}","agentSha256":"${agent_sha}"}
+          {"format":"happier-mutagen-engine","schemaVersion":1,"component":"mutagen-engine","engineVersion":"${GITHUB_REF_NAME#mutagen-v}","forkCommit":"${fork_commit}","forkBranch":"happier/external-stream-v1","sourceRepository":"https://github.com/happier-dev/mutagen","sourceTag":"${GITHUB_REF_NAME}","sourceArchive":"happier-mutagen-source-${GITHUB_REF_NAME}.tar.gz","transportSpikeCommit":"cd8069cf8b945dfa0d0f47d8685322c6f1e16e44","upstreamTag":"v0.18.1","upstreamCommit":"a225ae50aee3d7ebb59139203cb84e8a6a3ff4bf","toolchain":{"go":"1.22.12","goChecksum":"${go_checksum}"},"protocolEpoch":"external-stream-v1","targetTriple":"${{ matrix.target }}","managerPath":"${manager_relative_path}","agentPath":"${agent_relative_path}","licensePolicy":"mixed-mit-sspl","ssplEnabled":true,"buildTags":${build_tags_json},"managerBuildTags":["mutagensidecar","mutagensspl"],"agentBuildTags":${agent_tags_json},"cgoEnabled":${{ matrix.cgo == '1' }},"watcher":"${{ matrix.watcher }}","releaseTag":"${GITHUB_REF_NAME}","managerSha256":"${manager_sha}","agentSha256":"${agent_sha}"}
           EOF
           (
             cd "${root}"
