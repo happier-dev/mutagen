@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/mutagen-io/mutagen/pkg/synchronization"
@@ -55,7 +56,7 @@ func writeMarkerFile(t *testing.T, directory string) string {
 	return "marker.txt"
 }
 
-func TestRevalidateEndpointRootRejectsReplacedDirectory(t *testing.T) {
+func TestRevalidateEndpointRootPreventsOrRejectsReplacedDirectory(t *testing.T) {
 	parent := t.TempDir()
 	root := filepath.Join(parent, "root")
 	if err := os.Mkdir(root, 0o700); err != nil {
@@ -67,6 +68,15 @@ func TestRevalidateEndpointRootRejectsReplacedDirectory(t *testing.T) {
 	}
 	t.Cleanup(validated.close)
 	if err := os.Rename(root, filepath.Join(parent, "original")); err != nil {
+		// Windows directory handles deny renaming by default. Retaining the
+		// validated handle therefore prevents replacement before the final
+		// identity check instead of detecting it afterward.
+		if runtime.GOOS == "windows" {
+			if _, statErr := os.Stat(root); statErr != nil {
+				t.Fatal("retained root handle blocked rename but did not preserve the authorized root:", statErr)
+			}
+			return
+		}
 		t.Fatal("unable to move initial root:", err)
 	}
 	if err := os.Mkdir(root, 0o700); err != nil {
