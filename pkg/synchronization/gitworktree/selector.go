@@ -105,11 +105,18 @@ func (i *Ignorer) Close() {
 	}
 }
 
-// SelectionError reports a Git oracle failure observed during traversal. The
-// scanner checks this after traversal so an unavailable oracle cannot turn a
-// fail-closed partial snapshot into a successful relationship cycle.
+// SelectionError reports a Git oracle failure or a Git policy generation change
+// observed across the traversal. The scanner checks this after traversal so
+// neither an unavailable oracle nor a snapshot built from a superseded policy
+// generation can turn a fail-closed or stale partial snapshot into a successful
+// relationship cycle. The traversal itself stays lock-free: this is the single
+// post-scan inventory, and the next Refresh reloads the new generation.
 func (i *Ignorer) SelectionError() error {
-	if i.oracle != nil && i.oracle.failed {
+	if i.oracle == nil || i.oracle.failed {
+		return errSelectionUnavailable
+	}
+	fingerprint, err := policyFingerprint(i.root)
+	if err != nil || fingerprint != i.fingerprint {
 		return errSelectionUnavailable
 	}
 	return nil
@@ -305,14 +312,40 @@ func (o *checkIgnoreOracle) ignored(path string) (bool, error) {
 		}
 		fields[index] = field[:len(field)-1]
 	}
-	if !bytes.Equal(fields[3], []byte(path)) {
+	source, lineNumber, pattern, echoed := fields[0], fields[1], fields[2], fields[3]
+	if !bytes.Equal(echoed, []byte(path)) {
 		o.failed = true
 		return false, errors.New("Git ignore oracle response mismatch")
 	}
-	if len(fields[0]) == 0 {
+	// `git check-ignore -z --verbose --non-matching` emits exactly
+	// <source>NUL<line>NUL<pattern>NUL<path>NUL, with the three leading fields
+	// all populated when a policy line decided the path and all empty when none
+	// did. Any other combination means this is not the response contract the
+	// selector was built against, so it is a failure rather than a decision.
+	matched := len(source) != 0 || len(lineNumber) != 0 || len(pattern) != 0
+	if !matched {
 		return false, nil
 	}
-	return !bytes.HasPrefix(fields[2], []byte("!")), nil
+	if len(source) == 0 || len(pattern) == 0 || !validPolicyLineNumber(lineNumber) {
+		o.failed = true
+		return false, errors.New("malformed Git ignore oracle response")
+	}
+	return !bytes.HasPrefix(pattern, []byte("!")), nil
+}
+
+// validPolicyLineNumber reports whether a verbose check-ignore line number is a
+// plain positive decimal, which is the only form Git emits for a matched
+// policy line.
+func validPolicyLineNumber(value []byte) bool {
+	if len(value) == 0 || len(value) > 19 || value[0] == '0' {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (o *checkIgnoreOracle) close() {
@@ -362,7 +395,10 @@ func policyFingerprint(root string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	policyOutput, err := gitOutput(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", ".gitignore", "**/.gitignore")
+	// Do not apply repository excludes while inventorying policy files: an
+	// ignored nested .gitignore still changes Git's decision for descendants
+	// and therefore has to invalidate the persistent oracle at Refresh().
+	policyOutput, err := gitOutput(root, "ls-files", "-z", "--cached", "--others", "--", ".gitignore", "**/.gitignore")
 	if err != nil {
 		return "", err
 	}

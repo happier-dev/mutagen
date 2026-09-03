@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -389,6 +390,101 @@ func TestManagerCommandResponsesUseExportedSessionDTOs(t *testing.T) {
 		t.Fatal("terminate command failed:", err)
 	} else if acknowledged, ok := result.(map[string]bool); !ok || !acknowledged["ok"] {
 		t.Fatalf("terminate was not acknowledged: %#v", result)
+	}
+}
+
+// TestEngineManagerReconnectsPersistedExternalSessionsOnRestart covers engine
+// restart, which is the only path where the manager owns sessions it did not
+// just create. NewManager starts a synchronization loop for every persisted
+// unpaused session before it returns, and those loops resolve their endpoints
+// through the shared protocol handler registry. Registering the External
+// handler after manager construction therefore both writes that registry while
+// the reloaded loops are reading it and lets their first connect attempt miss
+// the handler entirely, which parks each session on the reconnect interval.
+func TestEngineManagerReconnectsPersistedExternalSessionsOnRestart(t *testing.T) {
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
+	dialer := commandTestDialer{alpha: t.TempDir(), beta: t.TempDir()}
+	previous := synchronization.ProtocolHandlers[url.Protocol_External]
+	defer func() { synchronization.ProtocolHandlers[url.Protocol_External] = previous }()
+
+	// Sessions are created paused, so each one is resumed and observed running
+	// before shutdown; that is what leaves an unpaused session on disk for the
+	// restarted manager to reload.
+	seed, err := NewEngineManager(nil, dialer)
+	if err != nil {
+		t.Fatal("unable to create seed engine manager:", err)
+	}
+	const sessionCount = 4
+	identifiers := make([]string, 0, sessionCount)
+	for index := 0; index < sessionCount; index++ {
+		name := fmt.Sprintf("session-%d", index)
+		create := map[string]any{
+			"t": "create", "requestId": "create-" + name,
+			"session": map[string]any{
+				"alpha": "external://opaque-alpha", "beta": "external://opaque-beta",
+				"mode": "one-way-safe", "name": name,
+				"contentPolicy": map[string]any{
+					"selection":            "all_files",
+					"extraIgnorePatterns":  []string{},
+					"extraIncludePatterns": []string{},
+					"includeGitDirectory":  false,
+				},
+			},
+		}
+		result, _, err := executeCommand(context.Background(), seed, commandFrame(t, "create-"+name, create))
+		if err != nil {
+			t.Fatal("create command failed:", err)
+		}
+		identifier := result.(synchronizationapi.Session).Identifier
+		resume := map[string]any{"t": "resume", "requestId": "resume-" + name, "sessionIdentifier": identifier}
+		if _, _, err := executeCommand(context.Background(), seed, commandFrame(t, "resume-"+name, resume)); err != nil {
+			t.Fatal("resume command failed:", err)
+		}
+		identifiers = append(identifiers, identifier)
+	}
+	for _, identifier := range identifiers {
+		awaitExternalSessionConnected(t, seed, identifier, 30*time.Second, "before engine restart")
+	}
+	seed.Shutdown()
+
+	// Restart against a registry that has no External handler yet, exactly as a
+	// freshly launched sidecar process would.
+	delete(synchronization.ProtocolHandlers, url.Protocol_External)
+	manager, err := NewEngineManager(nil, dialer)
+	if err != nil {
+		t.Fatal("unable to restart engine manager:", err)
+	}
+	defer manager.Shutdown()
+
+	// The reconnect interval is the failure signal: a reloaded session whose
+	// first connect attempt missed the handler waits it out before retrying, so
+	// every persisted session has to connect well inside it.
+	for _, identifier := range identifiers {
+		awaitExternalSessionConnected(t, manager, identifier, 10*time.Second, "after engine restart")
+	}
+}
+
+// awaitExternalSessionConnected waits for a session to leave the disconnected
+// and connecting statuses, which is the observable difference between a session
+// whose endpoints resolved and one parked on the reconnect interval.
+func awaitExternalSessionConnected(t *testing.T, manager *synchronization.Manager, identifier string, within time.Duration, stage string) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		session, err := getSession(context.Background(), manager, identifier)
+		if err != nil {
+			t.Fatalf("unable to inspect session %s %s: %v", identifier, stage, err)
+		}
+		if session.Paused {
+			t.Fatalf("session %s was paused %s", identifier, stage)
+		}
+		if session.Status >= synchronization.Status_Watching {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("External session %s did not connect %s within %s: status=%v", identifier, stage, within, session.Status)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

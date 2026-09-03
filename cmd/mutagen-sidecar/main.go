@@ -16,9 +16,6 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/externalbroker"
 	"github.com/mutagen-io/mutagen/pkg/logging"
 	"github.com/mutagen-io/mutagen/pkg/mutagen"
-	"github.com/mutagen-io/mutagen/pkg/synchronization"
-	externalprotocol "github.com/mutagen-io/mutagen/pkg/synchronization/protocols/external"
-	"github.com/mutagen-io/mutagen/pkg/url"
 )
 
 // rootMain is the entry point for the root command.
@@ -67,11 +64,10 @@ func runPrivateEngine() error {
 		return fmt.Errorf("unable to set Mutagen data directory: %w", err)
 	}
 	logger := logging.NewLogger(logging.LevelInfo, os.Stderr)
-	manager, err := synchronization.NewManager(logger.Sublogger("manager"))
+	manager, err := externalbroker.NewEngineManager(logger.Sublogger("manager"), broker)
 	if err != nil {
 		return fmt.Errorf("unable to initialize synchronization manager: %w", err)
 	}
-	synchronization.ProtocolHandlers[url.Protocol_External] = externalprotocol.NewProtocolHandler(broker)
 	ctx, cancel := signal.NotifyContext(context.Background(), cmd.TerminationSignals...)
 	defer cancel()
 	return externalbroker.ServeEngine(ctx, broker, manager)

@@ -9,10 +9,12 @@ import (
 	"sync"
 
 	synchronizationapi "github.com/mutagen-io/mutagen/pkg/api/models/synchronization"
+	"github.com/mutagen-io/mutagen/pkg/logging"
 	"github.com/mutagen-io/mutagen/pkg/selection"
 	"github.com/mutagen-io/mutagen/pkg/synchronization"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
+	externalprotocol "github.com/mutagen-io/mutagen/pkg/synchronization/protocols/external"
 	"github.com/mutagen-io/mutagen/pkg/url"
 )
 
@@ -66,6 +68,19 @@ type conflictProjection struct {
 	ShownCount     int                           `json:"shownCount"`
 	TruncatedCount int                           `json:"truncatedCount"`
 	Conflicts      []synchronizationapi.Conflict `json:"conflicts"`
+}
+
+// NewEngineManager bootstraps the private managed engine's synchronization
+// manager against the supplied external stream dialer. Handler registration has
+// to precede manager construction: NewManager starts a synchronization loop for
+// every persisted unpaused session before it returns, and those loops read the
+// shared protocol handler registry as they connect.
+func NewEngineManager(logger *logging.Logger, dialer externalprotocol.StreamDialer) (*synchronization.Manager, error) {
+	if dialer == nil {
+		return nil, errors.New("nil external stream dialer")
+	}
+	synchronization.ProtocolHandlers[url.Protocol_External] = externalprotocol.NewProtocolHandler(dialer)
+	return synchronization.NewManager(logger)
 }
 
 // ServeEngine maps the closed, generic command union to the existing Mutagen
