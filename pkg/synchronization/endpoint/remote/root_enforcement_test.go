@@ -65,6 +65,7 @@ func TestRevalidateEndpointRootRejectsReplacedDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal("unable to validate initial root:", err)
 	}
+	t.Cleanup(validated.close)
 	if err := os.Rename(root, filepath.Join(parent, "original")); err != nil {
 		t.Fatal("unable to move initial root:", err)
 	}

@@ -63,6 +63,7 @@ func ServeEndpointAtRoot(logger *logging.Logger, stream io.ReadWriteCloser, root
 type validatedEndpointRoot struct {
 	path string
 	info os.FileInfo
+	file *os.File
 }
 
 // ValidateEndpointRoot resolves and validates the target-owned root used by a
@@ -73,6 +74,7 @@ func ValidateEndpointRoot(root string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	defer validated.close()
 	return validated.path, nil
 }
 
@@ -102,11 +104,23 @@ func validateEndpointRootIdentity(root string) (validatedEndpointRoot, error) {
 	if err != nil {
 		return validatedEndpointRoot{}, fmt.Errorf("unable to normalize resolved synchronization root: %w", err)
 	}
-	metadata, err = os.Stat(realRoot)
+	rootFile, err := os.Open(realRoot)
 	if err != nil {
+		return validatedEndpointRoot{}, fmt.Errorf("unable to open resolved synchronization root: %w", err)
+	}
+	metadata, err = rootFile.Stat()
+	if err != nil {
+		rootFile.Close()
 		return validatedEndpointRoot{}, fmt.Errorf("unable to inspect resolved synchronization root: %w", err)
 	}
-	return validatedEndpointRoot{path: realRoot, info: metadata}, nil
+	return validatedEndpointRoot{path: realRoot, info: metadata, file: rootFile}, nil
+}
+
+func (r *validatedEndpointRoot) close() {
+	if r.file != nil {
+		r.file.Close()
+		r.file = nil
+	}
 }
 
 func revalidateEndpointRootIdentity(root validatedEndpointRoot) (string, error) {
@@ -114,6 +128,7 @@ func revalidateEndpointRootIdentity(root validatedEndpointRoot) (string, error) 
 	if err != nil {
 		return "", err
 	}
+	defer current.close()
 	if current.path != root.path || !os.SameFile(root.info, current.info) {
 		return "", errors.New("enforced synchronization root changed during initialization")
 	}
@@ -121,6 +136,7 @@ func revalidateEndpointRootIdentity(root validatedEndpointRoot) (string, error) 
 }
 
 func serveEndpointAtValidatedRoot(logger *logging.Logger, stream io.ReadWriteCloser, root validatedEndpointRoot) error {
+	defer root.close()
 	return serveEndpointWithRoot(logger, stream, root.path, &root)
 }
 
