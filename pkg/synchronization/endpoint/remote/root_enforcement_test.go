@@ -55,6 +55,27 @@ func writeMarkerFile(t *testing.T, directory string) string {
 	return "marker.txt"
 }
 
+func TestRevalidateEndpointRootRejectsReplacedDirectory(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "root")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal("unable to create root:", err)
+	}
+	validated, err := validateEndpointRootIdentity(root)
+	if err != nil {
+		t.Fatal("unable to validate initial root:", err)
+	}
+	if err := os.Rename(root, filepath.Join(parent, "original")); err != nil {
+		t.Fatal("unable to move initial root:", err)
+	}
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal("unable to create replacement root:", err)
+	}
+	if _, err := revalidateEndpointRootIdentity(validated); err == nil {
+		t.Fatal("replacement root retained the original rooted endpoint authority")
+	}
+}
+
 func TestServeEndpointAtRootRejectsEmptyRoot(t *testing.T) {
 	clientConnection, serverConnection := net.Pipe()
 	defer clientConnection.Close()

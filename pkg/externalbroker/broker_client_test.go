@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -590,4 +591,93 @@ func writeTestFrame(writer io.Writer, value any) error {
 	}
 	_, err = writer.Write(payload)
 	return err
+}
+
+func TestBrokerClientAcceptsDerivedLargeRequestFrameWithoutRaisingResponseLimit(t *testing.T) {
+	clientConnection, brokerConnection := net.Pipe()
+	defer brokerConnection.Close()
+	client := &BrokerClient{
+		connection: clientConnection, reader: bufio.NewReader(clientConnection),
+		commandRoot: context.Background(), commandStops: make(map[string]context.CancelFunc),
+		pending: make(map[string]chan json.RawMessage), cancelled: make(map[string]time.Time),
+		commands: make(chan BrokerCommand, 1), done: make(chan struct{}),
+	}
+	go client.readLoop()
+	defer client.Close()
+
+	patterns := make([]string, 128)
+	for index := range patterns {
+		patterns[index] = string(bytes.Repeat([]byte{byte('a' + index%26)}, 1024))
+	}
+	raw, err := json.Marshal(map[string]any{
+		"t": "command", "requestId": "large-create", "command": map[string]any{
+			"t": "create", "requestId": "large-create", "session": map[string]any{
+				"alpha": "external://alpha", "beta": "external://beta", "mode": "one-way-safe",
+				"contentPolicy": map[string]any{"selection": "all_files", "extraIgnorePatterns": patterns, "extraIncludePatterns": patterns},
+				"name":          "large-create", "labels": map[string]string{},
+			},
+		},
+	})
+	if err != nil || len(raw) <= MaximumControlFrameBytes {
+		t.Fatalf("test command did not exceed one frame: %d (%v)", len(raw), err)
+	}
+	if len(raw) > MaximumControlRequestFrameBytes {
+		t.Fatalf("valid maximum policy exceeded the derived request bound: %d", len(raw))
+	}
+	if err := writeTestRawFrame(brokerConnection, raw); err != nil {
+		t.Fatal("unable to write large request frame:", err)
+	}
+	select {
+	case command := <-client.Commands():
+		defer client.FinishCommand(command.RequestID)
+		if command.RequestID != "large-create" || !bytes.Equal(command.Raw, raw) {
+			t.Fatal("large request command was not delivered exactly")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("large request command was not dispatched")
+	}
+}
+
+func writeTestRawFrame(writer io.Writer, payload []byte) error {
+	var header [4]byte
+	binary.BigEndian.PutUint32(header[:], uint32(len(payload)))
+	if _, err := writer.Write(header[:]); err != nil {
+		return err
+	}
+	_, err := writer.Write(payload)
+	return err
+}
+
+func TestSendResultReturnsTypedProtocolErrorForOversizeWithoutClosingConnection(t *testing.T) {
+	clientConnection, brokerConnection := net.Pipe()
+	defer clientConnection.Close()
+	defer brokerConnection.Close()
+	client := &BrokerClient{connection: clientConnection}
+	result := make(chan error, 1)
+	go func() {
+		result <- client.SendResult("oversize", map[string]string{"body": strings.Repeat("x", MaximumControlFrameBytes)}, nil)
+		if err := client.SendResult("next", map[string]bool{"ok": true}, nil); err != nil {
+			result <- err
+		}
+	}()
+	reader := bufio.NewReader(brokerConnection)
+	raw, err := readControlFrame(reader)
+	if err != nil {
+		t.Fatal("unable to read typed oversize response:", err)
+	}
+	var response brokerError
+	if err := decodeStrict(raw, &response); err != nil || response.T != "error" || response.RequestID != "oversize" || response.Code != "protocol_error" {
+		t.Fatalf("oversize response was not converted to a typed protocol error: %s (%v)", raw, err)
+	}
+	raw, err = readControlFrame(reader)
+	if err != nil {
+		t.Fatal("connection did not remain usable after oversize response:", err)
+	}
+	var next brokerTag
+	if err := json.Unmarshal(raw, &next); err != nil || next.T != "result" || next.RequestID != "next" {
+		t.Fatalf("unexpected follow-up response: %s (%v)", raw, err)
+	}
+	if err := <-result; err != nil {
+		t.Fatal("typed oversize response failed:", err)
+	}
 }

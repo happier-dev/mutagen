@@ -11,11 +11,15 @@ import (
 )
 
 type releaseWorkflow struct {
-	Jobs map[string]releaseWorkflowJob `yaml:"jobs"`
+	Permissions map[string]string             `yaml:"permissions"`
+	Jobs        map[string]releaseWorkflowJob `yaml:"jobs"`
 }
 
 type releaseWorkflowJob struct {
 	Environment string                `yaml:"environment"`
+	If          string                `yaml:"if"`
+	Needs       []string              `yaml:"needs"`
+	Permissions map[string]string     `yaml:"permissions"`
 	Steps       []releaseWorkflowStep `yaml:"steps"`
 }
 
@@ -43,6 +47,28 @@ func TestHappierReleasePreservesMixedLicenseBuildContract(t *testing.T) {
 	}
 	if publishJob.Environment != "release" {
 		t.Errorf("publish job environment is %q, want release", publishJob.Environment)
+	}
+	if parsedWorkflow.Permissions["contents"] != "read" {
+		t.Errorf("workflow-wide contents permission is %q, want read", parsedWorkflow.Permissions["contents"])
+	}
+	if publishJob.Permissions["contents"] != "write" {
+		t.Errorf("publish contents permission is %q, want write", publishJob.Permissions["contents"])
+	}
+	if strings.Join(publishJob.Needs, ",") != "test,build" {
+		t.Errorf("publish dependencies are %v, want test and build", publishJob.Needs)
+	}
+	testJob, ok := parsedWorkflow.Jobs["test"]
+	if !ok {
+		t.Fatal("Happier release workflow has no exact-commit source test job")
+	}
+	testCommands := ""
+	for _, step := range testJob.Steps {
+		testCommands += step.Run
+	}
+	for _, command := range []string{"scripts/ci/setup_go.sh", "scripts/ci/setup_ssh.sh", "scripts/ci/setup_docker.sh", "scripts/ci/analyze.sh", "scripts/ci/test.sh"} {
+		if !strings.Contains(testCommands, command) {
+			t.Errorf("release source test job is missing %q", command)
+		}
 	}
 	var setupStep *releaseWorkflowStep
 	var setupStepIndex = -1
@@ -166,6 +192,8 @@ func TestHappierReleasePreservesMixedLicenseBuildContract(t *testing.T) {
 		`-o "${root}/${agent_relative_path}"`,
 		`"managerPath":"${manager_relative_path}"`,
 		`"agentPath":"${agent_relative_path}"`,
+		`"${root}/${manager_relative_path}" version`,
+		`"${root}/${agent_relative_path}" version`,
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Errorf("Happier release workflow is missing %q", required)
@@ -189,6 +217,21 @@ func TestHappierReleasePreservesMixedLicenseBuildContract(t *testing.T) {
 	}
 	if strings.Contains(provenance, "mutagenfanotify") {
 		t.Error("fork provenance still claims fanotify for the Happier managed release")
+	}
+	upstreamWorkflowBytes, err := os.ReadFile(filepath.Join(repositoryRoot, ".github", "workflows", "ci.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsedUpstreamWorkflow releaseWorkflow
+	if err := yaml.Unmarshal(upstreamWorkflowBytes, &parsedUpstreamWorkflow); err != nil {
+		t.Fatalf("upstream CI workflow is not valid YAML: %v", err)
+	}
+	upstreamRelease := parsedUpstreamWorkflow.Jobs["release"]
+	if parsedUpstreamWorkflow.Permissions["contents"] != "read" || upstreamRelease.Permissions["contents"] != "write" {
+		t.Error("inherited CI grants contents write outside its upstream-only publication job")
+	}
+	if upstreamRelease.If != "github.ref_type == 'tag' && github.repository == 'mutagen-io/mutagen'" {
+		t.Error("inherited upstream publisher is not restricted to the upstream repository")
 	}
 }
 

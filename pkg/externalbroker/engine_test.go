@@ -17,6 +17,7 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/mutagen"
 	"github.com/mutagen-io/mutagen/pkg/synchronization"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/endpoint/remote"
 	externalprotocol "github.com/mutagen-io/mutagen/pkg/synchronization/protocols/external"
 	"github.com/mutagen-io/mutagen/pkg/url"
@@ -68,9 +69,211 @@ func TestCommandDecoderRejectsProductOwnedConflictMutation(t *testing.T) {
 }
 
 func TestConflictProjectionReportsHonestBoundedCounts(t *testing.T) {
-	projection := projectConflicts([]synchronizationapi.Conflict{{}, {}, {}}, 2, 2)
+	projection, err := projectConflictPage("request-01", []synchronizationapi.Conflict{{Root: "c"}, {Root: "a"}, {Root: "b"}}, 2, "", 2)
+	if err != nil {
+		t.Fatal("unable to project conflicts:", err)
+	}
 	if projection.TotalCount != 5 || projection.ShownCount != 2 || projection.TruncatedCount != 3 || len(projection.Conflicts) != 2 {
 		t.Fatalf("dishonest bounded conflict projection: %+v", projection)
+	}
+	if projection.Conflicts[0].Root != "a" || projection.Conflicts[1].Root != "b" || projection.NextCursor == nil {
+		t.Fatalf("conflicts were not stably ordered and paginated: %+v", projection)
+	}
+}
+
+func TestConflictProjectionFitsControlFrameAndPreservesCounts(t *testing.T) {
+	conflicts := make([]synchronizationapi.Conflict, 100)
+	for index := range conflicts {
+		conflicts[index].Root = fmt.Sprintf("%03d-%s", index, strings.Repeat("x", 4096))
+	}
+	projection, err := projectConflictPage("request-01", conflicts, 7, "", 100)
+	if err != nil {
+		t.Fatal("unable to project conflicts:", err)
+	}
+	if projection.TotalCount != 107 || projection.ShownCount != len(projection.Conflicts) || projection.TruncatedCount != 107-projection.ShownCount {
+		t.Fatalf("byte-bounded projection reported dishonest counts: %+v", projection)
+	}
+	if projection.ShownCount == 0 || projection.ShownCount >= len(conflicts) {
+		t.Fatalf("test did not exercise byte-budget truncation: %+v", projection)
+	}
+	if !resultFitsControlFrame("request-01", projection) {
+		t.Fatal("projected conflicts exceed the broker control frame")
+	}
+}
+
+func TestConflictPaginationExhaustsStablePagesAndRejectsAChangedView(t *testing.T) {
+	conflicts := []synchronizationapi.Conflict{{Root: "c"}, {Root: "a"}, {Root: "b"}}
+	first, err := projectConflictPage("request-01", conflicts, 0, "", 2)
+	if err != nil || first.NextCursor == nil || first.ShownCount != 2 || first.TruncatedCount != 1 {
+		t.Fatalf("invalid first page: %+v (%v)", first, err)
+	}
+	second, err := projectConflictPage("request-02", conflicts, 0, *first.NextCursor, 2)
+	if err != nil || second.NextCursor != nil || second.ShownCount != 1 || second.TruncatedCount != 0 || second.Conflicts[0].Root != "c" {
+		t.Fatalf("invalid second page: %+v (%v)", second, err)
+	}
+	changed := append(conflicts, synchronizationapi.Conflict{Root: "d"})
+	if _, err := projectConflictPage("request-03", changed, 0, *first.NextCursor, 2); err == nil {
+		t.Fatalf("changed conflict view did not invalidate the cursor: %v", err)
+	} else if coded, ok := err.(interface{ BrokerCode() string }); !ok || coded.BrokerCode() != "cursor_invalidated" {
+		t.Fatalf("changed conflict view returned the wrong typed error: %v", err)
+	}
+}
+
+func compactSessionState(identifier string) *synchronization.State {
+	return &synchronization.State{
+		Session: &synchronization.Session{
+			Identifier:    identifier,
+			Name:          identifier,
+			Labels:        map[string]string{"external.owner": "happier-workspace-sync"},
+			Alpha:         &url.URL{Protocol: url.Protocol_External, Host: "alpha-" + identifier},
+			Beta:          &url.URL{Protocol: url.Protocol_External, Host: "beta-" + identifier},
+			Configuration: &synchronization.Configuration{SynchronizationMode: core.SynchronizationMode_SynchronizationModeOneWaySafe},
+		},
+		AlphaState: &synchronization.EndpointState{},
+		BetaState:  &synchronization.EndpointState{},
+	}
+}
+
+func TestSessionListPaginationUsesStableIdentifierCursor(t *testing.T) {
+	states := []*synchronization.State{compactSessionState("session-c"), compactSessionState("session-a"), compactSessionState("session-b")}
+	first, err := projectSessionPage("request-01", states, "", 2)
+	if err != nil {
+		t.Fatal("unable to project first page:", err)
+	}
+	if len(first.Sessions) != 2 || first.Sessions[0].Identifier != "session-a" || first.Sessions[1].Identifier != "session-b" || first.NextCursor == nil || !strings.HasPrefix(*first.NextCursor, "s1_") {
+		t.Fatalf("unexpected first page: %+v", first)
+	}
+	second, err := projectSessionPage("request-02", states, *first.NextCursor, 2)
+	if err != nil {
+		t.Fatal("unable to project second page:", err)
+	}
+	if len(second.Sessions) != 1 || second.Sessions[0].Identifier != "session-c" || second.NextCursor != nil {
+		t.Fatalf("unexpected second page: %+v", second)
+	}
+	changed := append([]*synchronization.State{compactSessionState("session-0")}, states...)
+	if _, err := projectSessionPage("request-03", changed, *first.NextCursor, 2); err == nil {
+		t.Fatal("changed session view accepted a stale continuation cursor")
+	} else if coded, ok := err.(interface{ BrokerCode() string }); !ok || coded.BrokerCode() != "cursor_invalidated" {
+		t.Fatalf("changed session view returned the wrong error: %v", err)
+	}
+}
+
+func TestCompactSessionSummaryOmitsPolicyBodiesAndFitsOneControlFrame(t *testing.T) {
+	state := compactSessionState("session-large-policy")
+	state.Session.Configuration.Ignores = make([]string, 256)
+	for index := range state.Session.Configuration.Ignores {
+		state.Session.Configuration.Ignores[index] = fmt.Sprintf("%03d-%s", index, strings.Repeat("x", 1024))
+	}
+	summary := summarizeSession(state)
+	encoded, err := json.Marshal(summary)
+	if err != nil {
+		t.Fatal("unable to encode summary:", err)
+	}
+	if strings.Contains(string(encoded), "ignorePaths") || !resultFitsControlFrame("request-01", summary) {
+		t.Fatalf("summary leaked policy bodies or exceeded one frame: %s", encoded)
+	}
+}
+
+func TestPolicyBodiesAreAvailableOnlyThroughBoundedPages(t *testing.T) {
+	state := compactSessionState("session-policy")
+	state.Session.Configuration.DefaultIgnores = []string{"engine-owned-default"}
+	state.Session.Configuration.Ignores = make([]string, 128)
+	for index := range state.Session.Configuration.Ignores {
+		state.Session.Configuration.Ignores[index] = fmt.Sprintf("%03d-%s", index, strings.Repeat("x", 1020))
+	}
+	first, _, err := projectPolicyPage("request-01", state, "", 100)
+	if err != nil || first.Selection != "all_files" || len(first.Patterns) == 0 || first.Patterns[0] == "engine-owned-default" || len(first.Patterns) >= len(state.Session.Configuration.Ignores) || first.NextCursor == nil || !resultFitsControlFrame("request-01", first) {
+		t.Fatalf("invalid byte-bounded policy page: %+v (%v)", first, err)
+	}
+	second, _, err := projectPolicyPage("request-02", state, *first.NextCursor, 100)
+	if err != nil || second.Selection != first.Selection || len(second.Patterns) == 0 {
+		t.Fatalf("policy continuation was not readable: %+v (%v)", second, err)
+	}
+	state.Session.Configuration.Ignores[0] = "changed-policy"
+	if _, _, err := projectPolicyPage("request-03", state, *first.NextCursor, 100); err == nil {
+		t.Fatal("changed policy view accepted a stale continuation cursor")
+	} else if coded, ok := err.(interface{ BrokerCode() string }); !ok || coded.BrokerCode() != "cursor_invalidated" {
+		t.Fatalf("changed policy view returned the wrong error: %v", err)
+	}
+}
+
+func TestPolicyPageProjectsGitWorktreeSelectionOutOfBand(t *testing.T) {
+	state := compactSessionState("session-git-policy")
+	state.Session.Configuration.IgnoreSyntax = ignore.Syntax_SyntaxGitWorktree
+	state.Session.Configuration.Ignores = []string{"build/", "!build/keep.txt", ".git/"}
+	page, _, err := projectPolicyPage("request-01", state, "", 100)
+	if err != nil || page.Selection != "git_worktree" || len(page.Patterns) != 3 || page.Patterns[0] != "build/" {
+		t.Fatalf("Git selector was not projected independently of ignore patterns: %+v (%v)", page, err)
+	}
+}
+
+func TestExecuteCommandDecodesMaximumPolicyAboveResponseFrameLimit(t *testing.T) {
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
+	manager, err := synchronization.NewManager(nil)
+	if err != nil {
+		t.Fatal("unable to create manager:", err)
+	}
+	defer manager.Shutdown()
+	previous := synchronization.ProtocolHandlers[url.Protocol_External]
+	synchronization.ProtocolHandlers[url.Protocol_External] = externalprotocol.NewProtocolHandler(commandTestDialer{alpha: t.TempDir(), beta: t.TempDir()})
+	defer func() { synchronization.ProtocolHandlers[url.Protocol_External] = previous }()
+
+	patterns := make([]string, 128)
+	for index := range patterns {
+		patterns[index] = fmt.Sprintf("%03d-%s", index, strings.Repeat("x", 1020))
+	}
+	command := map[string]any{
+		"t": "create", "requestId": "large-create",
+		"session": map[string]any{
+			"alpha": "external://opaque-alpha", "beta": "external://opaque-beta", "mode": "one-way-safe",
+			"name": "large-session", "labels": map[string]string{},
+			"contentPolicy": map[string]any{"selection": "all_files", "extraIgnorePatterns": patterns, "extraIncludePatterns": patterns},
+		},
+	}
+	raw := commandFrame(t, "large-create", command)
+	if len(raw) <= MaximumControlFrameBytes {
+		t.Fatalf("test command did not cross response frame boundary: %d", len(raw))
+	}
+	if serialKey, shutdown := commandScheduling(raw); serialKey != "session:large-session" || shutdown {
+		t.Fatalf("large command did not pass engine scheduling decode: key=%q shutdown=%v", serialKey, shutdown)
+	}
+	result, _, err := executeCommand(context.Background(), manager, raw)
+	if err != nil {
+		t.Fatal("maximum public policy command failed strict engine decoding:", err)
+	}
+	if summary, ok := result.(sessionSummary); !ok || summary.Name != "large-session" {
+		t.Fatalf("unexpected large create result: %#v", result)
+	}
+}
+
+func TestWorkspaceContentPolicyV1WireLimitsMatchPublicProtocol(t *testing.T) {
+	valid := contentPolicy{
+		ExtraIgnorePatterns:  make([]string, 128),
+		ExtraIncludePatterns: make([]string, 128),
+	}
+	for index := range valid.ExtraIgnorePatterns {
+		valid.ExtraIgnorePatterns[index] = strings.Repeat("x", 1024)
+		valid.ExtraIncludePatterns[index] = strings.Repeat("y", 1024)
+	}
+	if err := validateContentPolicy(valid); err != nil {
+		t.Fatalf("public maximum policy was rejected: %v", err)
+	}
+	tooMany := valid
+	tooMany.ExtraIgnorePatterns = append(append([]string(nil), valid.ExtraIgnorePatterns...), "x")
+	if err := validateContentPolicy(tooMany); err == nil {
+		t.Fatal("129th policy pattern was accepted")
+	}
+	tooLarge := valid
+	tooLarge.ExtraIncludePatterns = append([]string(nil), valid.ExtraIncludePatterns...)
+	tooLarge.ExtraIncludePatterns[0] = strings.Repeat("x", 1025)
+	if err := validateContentPolicy(tooLarge); err == nil {
+		t.Fatal("1025-byte policy pattern was accepted")
+	}
+	negatedInclude := valid
+	negatedInclude.ExtraIncludePatterns = append([]string(nil), valid.ExtraIncludePatterns...)
+	negatedInclude.ExtraIncludePatterns[0] = "!src/generated.ts"
+	if err := validateContentPolicy(negatedInclude); err == nil {
+		t.Fatal("negated positive include pattern was accepted")
 	}
 }
 
@@ -84,14 +287,20 @@ func TestCreateRequiresCallerSuppliedOpaqueExternalEndpoints(t *testing.T) {
 	}
 }
 
-func TestCreateRejectsGitDirectoryInclusion(t *testing.T) {
-	definition := sessionDefinition{
-		Alpha: "external://opaque-alpha", Beta: "external://opaque-beta",
-		Mode: core.SynchronizationMode_SynchronizationModeOneWaySafe, Name: "session-1",
-		ContentPolicy: contentPolicy{Selection: "git_worktree", IncludeGitDirectory: true},
+func TestCreateRejectsRemovedGitDirectoryInclusionField(t *testing.T) {
+	command := map[string]any{
+		"t": "create", "requestId": "request-01",
+		"session": map[string]any{
+			"alpha": "external://opaque-alpha", "beta": "external://opaque-beta",
+			"mode": "one-way-safe", "name": "session-1", "labels": map[string]string{},
+			"contentPolicy": map[string]any{
+				"selection": "git_worktree", "extraIgnorePatterns": []string{},
+				"extraIncludePatterns": []string{}, "includeGitDirectory": true,
+			},
+		},
 	}
-	if _, err := createSession(context.Background(), nil, definition); err == nil || !strings.Contains(err.Error(), "includeGitDirectory") {
-		t.Fatalf("inert Git directory inclusion policy did not fail closed: %v", err)
+	if _, _, err := executeCommand(context.Background(), nil, commandFrame(t, "request-01", command)); err == nil || !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("removed Git directory inclusion field did not fail closed: %v", err)
 	}
 }
 
@@ -327,7 +536,7 @@ func (d commandTestDialer) Dial(_ context.Context, request externalprotocol.Dial
 	return client, nil
 }
 
-func TestManagerCommandResponsesUseExportedSessionDTOs(t *testing.T) {
+func TestManagerCommandResponsesUseCompactSessionSummariesAndPagedList(t *testing.T) {
 	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
 	manager, err := synchronization.NewManager(nil)
 	if err != nil {
@@ -338,7 +547,7 @@ func TestManagerCommandResponsesUseExportedSessionDTOs(t *testing.T) {
 	synchronization.ProtocolHandlers[url.Protocol_External] = externalprotocol.NewProtocolHandler(commandTestDialer{alpha: t.TempDir(), beta: t.TempDir()})
 	defer func() { synchronization.ProtocolHandlers[url.Protocol_External] = previous }()
 
-	policy := map[string]any{"selection": "all_files", "extraIgnorePatterns": []string{}, "extraIncludePatterns": []string{}, "includeGitDirectory": false}
+	policy := map[string]any{"selection": "all_files", "extraIgnorePatterns": []string{}, "extraIncludePatterns": []string{}}
 	session := map[string]any{
 		"alpha": "external://opaque-alpha", "beta": "external://opaque-beta",
 		"mode": "one-way-safe", "contentPolicy": policy, "name": "session-1",
@@ -349,9 +558,18 @@ func TestManagerCommandResponsesUseExportedSessionDTOs(t *testing.T) {
 	if err != nil {
 		t.Fatal("create command failed:", err)
 	}
-	created, ok := result.(synchronizationapi.Session)
+	created, ok := result.(sessionSummary)
 	if !ok || created.Name != "session-1" || created.Mode != core.SynchronizationMode_SynchronizationModeOneWaySafe || created.Labels["caller.owner"] != "adapter" || created.Labels["caller.operation"] != "opaque-1" || len(created.Labels) != 2 || created.Alpha.Protocol != url.Protocol_External || created.Alpha.Host != "opaque-alpha" || created.Beta.Protocol != url.Protocol_External || created.Beta.Host != "opaque-beta" || created.Alpha.Path != "" || created.Beta.Path != "" {
-		t.Fatalf("create did not return the canonical exported session DTO: %#v", result)
+		t.Fatalf("create did not return the compact session summary: %#v", result)
+	}
+	encoded, err := json.Marshal(created)
+	if err != nil {
+		t.Fatal("unable to encode compact summary:", err)
+	}
+	for _, forbidden := range []string{"configuration", "creationTime", "creatingVersion", "conflicts", "scanProblems", "transitionProblems", "ignorePaths"} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("compact summary leaked verbose field %q: %s", forbidden, encoded)
+		}
 	}
 
 	for _, tag := range []string{"get", "resume", "flush", "pause"} {
@@ -373,17 +591,17 @@ func TestManagerCommandResponsesUseExportedSessionDTOs(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s command failed: %v", tag, err)
 		}
-		if _, ok := result.(synchronizationapi.Session); !ok {
-			t.Fatalf("%s did not return an exported session DTO: %#v", tag, result)
+		if _, ok := result.(sessionSummary); !ok {
+			t.Fatalf("%s did not return a compact session summary: %#v", tag, result)
 		}
 	}
-	list := map[string]any{"t": "list", "requestId": "list-1"}
+	list := map[string]any{"t": "list", "requestId": "list-1", "limit": 100}
 	result, _, err = executeCommand(context.Background(), manager, commandFrame(t, "list-1", list))
 	if err != nil {
 		t.Fatal("list command failed:", err)
 	}
-	if sessions, ok := result.([]synchronizationapi.Session); !ok || len(sessions) != 1 {
-		t.Fatalf("list did not return exported session DTOs: %#v", result)
+	if page, ok := result.(sessionListPage); !ok || len(page.Sessions) != 1 || page.NextCursor != nil {
+		t.Fatalf("list did not return a compact terminal page: %#v", result)
 	}
 	terminate := map[string]any{"t": "terminate", "requestId": "terminate-1", "sessionIdentifier": created.Identifier}
 	if result, _, err = executeCommand(context.Background(), manager, commandFrame(t, "terminate-1", terminate)); err != nil {
@@ -427,7 +645,6 @@ func TestEngineManagerReconnectsPersistedExternalSessionsOnRestart(t *testing.T)
 					"selection":            "all_files",
 					"extraIgnorePatterns":  []string{},
 					"extraIncludePatterns": []string{},
-					"includeGitDirectory":  false,
 				},
 			},
 		}
@@ -435,7 +652,7 @@ func TestEngineManagerReconnectsPersistedExternalSessionsOnRestart(t *testing.T)
 		if err != nil {
 			t.Fatal("create command failed:", err)
 		}
-		identifier := result.(synchronizationapi.Session).Identifier
+		identifier := result.(sessionSummary).Identifier
 		resume := map[string]any{"t": "resume", "requestId": "resume-" + name, "sessionIdentifier": identifier}
 		if _, _, err := executeCommand(context.Background(), seed, commandFrame(t, "resume-"+name, resume)); err != nil {
 			t.Fatal("resume command failed:", err)

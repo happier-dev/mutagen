@@ -23,10 +23,12 @@ import (
 const (
 	BrokerProtocolVersion    = 1
 	MaximumControlFrameBytes = 65_536
-	MaximumIdentifierBytes   = 256
-	openDataLifetime         = 15 * time.Second
-	cancelledRequestLifetime = time.Minute
-	maximumCancelledRequests = 256
+	// Two 128×1024-byte policy arrays, worst-case JSON escaping, and request metadata.
+	MaximumControlRequestFrameBytes = 2 * 1024 * 1024
+	MaximumIdentifierBytes          = 256
+	openDataLifetime                = 15 * time.Second
+	cancelledRequestLifetime        = time.Minute
+	maximumCancelledRequests        = 256
 )
 
 // BrokerDescriptor is delivered through the inherited descriptor, never argv
@@ -111,6 +113,18 @@ type brokerError struct {
 	RequestID string `json:"requestId,omitempty"`
 	Code      string `json:"code"`
 	Message   string `json:"message"`
+}
+
+type brokerResponseErrorValue struct {
+	code    string
+	message string
+}
+
+func (e *brokerResponseErrorValue) Error() string      { return e.message }
+func (e *brokerResponseErrorValue) BrokerCode() string { return e.code }
+
+func newBrokerResponseError(code, message string) error {
+	return &brokerResponseErrorValue{code: code, message: message}
 }
 
 func brokerResponseError(raw json.RawMessage) error {
@@ -267,12 +281,31 @@ func (c *BrokerClient) Dial(ctx context.Context, request externalprotocol.DialRe
 
 func (c *BrokerClient) SendResult(requestID string, result any, commandError error) error {
 	if commandError != nil {
+		code := "engine_unavailable"
+		if coded, ok := commandError.(interface{ BrokerCode() string }); ok {
+			code = coded.BrokerCode()
+		}
 		return c.write(map[string]any{
 			"t": "error", "requestId": requestID,
-			"code": "engine_unavailable", "message": commandError.Error(),
+			"code": code, "message": boundedResponseString(commandError.Error(), 4096),
 		})
 	}
-	return c.write(map[string]any{"t": "result", "requestId": requestID, "result": result})
+	response := map[string]any{"t": "result", "requestId": requestID, "result": result}
+	payload, err := json.Marshal(response)
+	if err != nil {
+		return c.write(map[string]any{"t": "error", "requestId": requestID, "code": "protocol_error", "message": "unable to encode command result"})
+	}
+	if len(payload) > MaximumControlFrameBytes {
+		return c.write(map[string]any{"t": "error", "requestId": requestID, "code": "protocol_error", "message": "command result exceeds response frame limit"})
+	}
+	return c.writePayload(payload)
+}
+
+func boundedResponseString(value string, maximum int) string {
+	if len(value) <= maximum {
+		return value
+	}
+	return value[:maximum]
 }
 
 func (c *BrokerClient) request(ctx context.Context, key string, message any) (json.RawMessage, error) {
@@ -357,7 +390,7 @@ func (c *BrokerClient) readLoop() {
 	defer close(c.commands)
 	defer c.cancelCommands()
 	for {
-		raw, err := readControlFrame(c.reader)
+		raw, err := readControlFrameWithLimit(c.reader, MaximumControlRequestFrameBytes)
 		if err != nil {
 			c.setErr(err)
 			return
@@ -445,8 +478,6 @@ func (c *BrokerClient) setErr(err error) {
 }
 
 func (c *BrokerClient) write(value any) error {
-	c.writeLock.Lock()
-	defer c.writeLock.Unlock()
 	payload, err := json.Marshal(value)
 	if err != nil {
 		return err
@@ -454,22 +485,32 @@ func (c *BrokerClient) write(value any) error {
 	if len(payload) == 0 || len(payload) > MaximumControlFrameBytes {
 		return errors.New("control frame exceeds limit")
 	}
+	return c.writePayload(payload)
+}
+
+func (c *BrokerClient) writePayload(payload []byte) error {
+	c.writeLock.Lock()
+	defer c.writeLock.Unlock()
 	var header [4]byte
 	binary.BigEndian.PutUint32(header[:], uint32(len(payload)))
 	if _, err := c.connection.Write(header[:]); err != nil {
 		return err
 	}
-	_, err = c.connection.Write(payload)
+	_, err := c.connection.Write(payload)
 	return err
 }
 
 func readControlFrame(reader io.Reader) (json.RawMessage, error) {
+	return readControlFrameWithLimit(reader, MaximumControlFrameBytes)
+}
+
+func readControlFrameWithLimit(reader io.Reader, maximum uint32) (json.RawMessage, error) {
 	var header [4]byte
 	if _, err := io.ReadFull(reader, header[:]); err != nil {
 		return nil, err
 	}
 	length := binary.BigEndian.Uint32(header[:])
-	if length == 0 || length > MaximumControlFrameBytes {
+	if length == 0 || length > maximum {
 		return nil, errors.New("invalid control frame length")
 	}
 	payload := make([]byte, length)
@@ -480,7 +521,18 @@ func readControlFrame(reader io.Reader) (json.RawMessage, error) {
 }
 
 func decodeStrict(raw []byte, destination any) error {
-	decoder := json.NewDecoder(io.LimitReader(bytesReader(raw), MaximumControlFrameBytes))
+	return decodeStrictWithLimit(raw, destination, MaximumControlFrameBytes)
+}
+
+func decodeCommandStrict(raw []byte, destination any) error {
+	return decodeStrictWithLimit(raw, destination, MaximumControlRequestFrameBytes)
+}
+
+func decodeStrictWithLimit(raw []byte, destination any, maximum int) error {
+	if len(raw) > maximum {
+		return errors.New("JSON value exceeds frame limit")
+	}
+	decoder := json.NewDecoder(io.LimitReader(bytesReader(raw), int64(maximum)))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(destination); err != nil {
 		return err

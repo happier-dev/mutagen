@@ -2,9 +2,13 @@ package externalbroker
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -16,6 +20,13 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
 	externalprotocol "github.com/mutagen-io/mutagen/pkg/synchronization/protocols/external"
 	"github.com/mutagen-io/mutagen/pkg/url"
+)
+
+// These mirror the public WorkspaceContentPolicyV1 boundary; the boundary test
+// pins the exact accepted and rejected edges on the Go side of the wire.
+const (
+	maximumContentPolicyPatterns     = 128
+	maximumContentPolicyPatternBytes = 1024
 )
 
 type commandEnvelope struct {
@@ -42,7 +53,6 @@ type contentPolicy struct {
 	Selection            string   `json:"selection"`
 	ExtraIgnorePatterns  []string `json:"extraIgnorePatterns"`
 	ExtraIncludePatterns []string `json:"extraIncludePatterns"`
-	IncludeGitDirectory  bool     `json:"includeGitDirectory"`
 }
 
 type createCommand struct {
@@ -56,11 +66,41 @@ type selectedCommand struct {
 	RequestID         string `json:"requestId"`
 	SessionIdentifier string `json:"sessionIdentifier"`
 	Limit             int    `json:"limit,omitempty"`
+	Cursor            string `json:"cursor,omitempty"`
 }
 
 type listCommand struct {
 	T         string `json:"t"`
 	RequestID string `json:"requestId"`
+	Cursor    string `json:"cursor,omitempty"`
+	Limit     int    `json:"limit,omitempty"`
+}
+
+type sessionEndpointSummary struct {
+	Protocol  url.Protocol `json:"protocol"`
+	Host      string       `json:"host"`
+	Path      string       `json:"path"`
+	Connected bool         `json:"connected"`
+	Scanned   bool         `json:"scanned"`
+}
+
+type sessionSummary struct {
+	Identifier       string                   `json:"identifier"`
+	Name             string                   `json:"name"`
+	Labels           map[string]string        `json:"labels"`
+	Alpha            sessionEndpointSummary   `json:"alpha"`
+	Beta             sessionEndpointSummary   `json:"beta"`
+	Mode             core.SynchronizationMode `json:"mode"`
+	Paused           bool                     `json:"paused"`
+	Status           synchronization.Status   `json:"status"`
+	SuccessfulCycles uint64                   `json:"successfulCycles"`
+	ConflictCount    uint64                   `json:"conflictCount"`
+	LastError        string                   `json:"lastError,omitempty"`
+}
+
+type sessionListPage struct {
+	Sessions   []sessionSummary `json:"sessions"`
+	NextCursor *string          `json:"nextCursor"`
 }
 
 type conflictProjection struct {
@@ -68,6 +108,13 @@ type conflictProjection struct {
 	ShownCount     int                           `json:"shownCount"`
 	TruncatedCount int                           `json:"truncatedCount"`
 	Conflicts      []synchronizationapi.Conflict `json:"conflicts"`
+	NextCursor     *string                       `json:"nextCursor"`
+}
+
+type policyPage struct {
+	Selection  string   `json:"selection"`
+	Patterns   []string `json:"patterns"`
+	NextCursor *string  `json:"nextCursor"`
 }
 
 // NewEngineManager bootstraps the private managed engine's synchronization
@@ -223,7 +270,7 @@ func serveEngineWithShutdown(ctx context.Context, broker *BrokerClient, manager 
 // second protocol validator.
 func commandScheduling(raw json.RawMessage) (string, bool) {
 	var envelope commandEnvelope
-	if err := decodeStrict(raw, &envelope); err != nil || envelope.T != "command" {
+	if err := decodeCommandStrict(raw, &envelope); err != nil || envelope.T != "command" {
 		return "", false
 	}
 	var tag commandTag
@@ -233,17 +280,17 @@ func commandScheduling(raw json.RawMessage) (string, bool) {
 	switch tag.T {
 	case "create":
 		var command createCommand
-		if err := decodeStrict(envelope.Command, &command); err == nil && command.Session.Name != "" {
+		if err := decodeCommandStrict(envelope.Command, &command); err == nil && command.Session.Name != "" {
 			return "session:" + command.Session.Name, false
 		}
 	case "flush", "pause", "resume", "terminate":
 		var command selectedCommand
-		if err := decodeStrict(envelope.Command, &command); err == nil && validIdentifier(command.SessionIdentifier) {
+		if err := decodeCommandStrict(envelope.Command, &command); err == nil && validIdentifier(command.SessionIdentifier) {
 			return "session:" + command.SessionIdentifier, false
 		}
 	case "shutdown":
 		var command listCommand
-		if err := decodeStrict(envelope.Command, &command); err == nil {
+		if err := decodeCommandStrict(envelope.Command, &command); err == nil {
 			return "", true
 		}
 	}
@@ -252,7 +299,7 @@ func commandScheduling(raw json.RawMessage) (string, bool) {
 
 func executeCommand(ctx context.Context, manager *synchronization.Manager, raw json.RawMessage) (any, bool, error) {
 	var envelope commandEnvelope
-	if err := decodeStrict(raw, &envelope); err != nil || envelope.T != "command" || !validIdentifier(envelope.RequestID) {
+	if err := decodeCommandStrict(raw, &envelope); err != nil || envelope.T != "command" || !validIdentifier(envelope.RequestID) {
 		return nil, false, errors.New("malformed command envelope")
 	}
 	var tag commandTag
@@ -262,7 +309,7 @@ func executeCommand(ctx context.Context, manager *synchronization.Manager, raw j
 	switch tag.T {
 	case "create":
 		var command createCommand
-		if err := decodeStrict(envelope.Command, &command); err != nil {
+		if err := decodeCommandStrict(envelope.Command, &command); err != nil {
 			return nil, false, err
 		}
 		identifier, err := createSession(ctx, manager, command.Session)
@@ -271,9 +318,9 @@ func executeCommand(ctx context.Context, manager *synchronization.Manager, raw j
 		}
 		status, err := getSession(ctx, manager, identifier)
 		return status, false, err
-	case "get", "flush", "pause", "resume", "terminate", "list_conflicts":
+	case "get", "flush", "pause", "resume", "terminate", "get_policy", "list_conflicts":
 		var command selectedCommand
-		if err := decodeStrict(envelope.Command, &command); err != nil || !validIdentifier(command.SessionIdentifier) {
+		if err := decodeCommandStrict(envelope.Command, &command); err != nil || !validIdentifier(command.SessionIdentifier) {
 			return nil, false, errors.New("invalid selected command")
 		}
 		selected := &selection.Selection{Specifications: []string{command.SessionIdentifier}}
@@ -304,8 +351,20 @@ func executeCommand(ctx context.Context, manager *synchronization.Manager, raw j
 				return nil, false, err
 			}
 			return map[string]bool{"ok": true}, false, nil
+		case "get_policy":
+			if command.Limit < 1 || command.Limit > 100 || (command.Cursor != "" && !validIdentifier(command.Cursor)) {
+				return nil, false, errors.New("invalid policy page")
+			}
+			_, states, err := manager.List(ctx, selected, 0)
+			if err != nil {
+				return nil, false, err
+			}
+			if len(states) != 1 {
+				return nil, false, errors.New("unexpected selected session count")
+			}
+			return projectPolicyPage(envelope.RequestID, states[0], command.Cursor, command.Limit)
 		case "list_conflicts":
-			if command.Limit < 1 || command.Limit > 100 {
+			if command.Limit < 1 || command.Limit > 100 || (command.Cursor != "" && !validIdentifier(command.Cursor)) {
 				return nil, false, errors.New("conflict limit must be between 1 and 100")
 			}
 			_, states, err := manager.List(ctx, selected, 0)
@@ -320,22 +379,24 @@ func executeCommand(ctx context.Context, manager *synchronization.Manager, raw j
 			if exported[0].SessionState != nil {
 				conflicts = exported[0].Conflicts
 			}
-			return projectConflicts(conflicts, states[0].ExcludedConflicts, command.Limit), false, nil
+			page, err := projectConflictPage(envelope.RequestID, conflicts, states[0].ExcludedConflicts, command.Cursor, command.Limit)
+			return page, false, err
 		}
 		return nil, false, errors.New("invalid selected command")
 	case "list":
 		var command listCommand
-		if err := decodeStrict(envelope.Command, &command); err != nil {
-			return nil, false, err
+		if err := decodeCommandStrict(envelope.Command, &command); err != nil || command.Limit < 1 || command.Limit > 100 || (command.Cursor != "" && !validIdentifier(command.Cursor)) {
+			return nil, false, errors.New("invalid list command")
 		}
 		_, states, err := manager.List(ctx, &selection.Selection{All: true}, 0)
 		if err != nil {
 			return nil, false, err
 		}
-		return synchronizationapi.ExportSessions(states), false, nil
+		page, err := projectSessionPage(envelope.RequestID, states, command.Cursor, command.Limit)
+		return page, false, err
 	case "shutdown":
 		var command listCommand
-		if err := decodeStrict(envelope.Command, &command); err != nil {
+		if err := decodeCommandStrict(envelope.Command, &command); err != nil {
 			return nil, false, err
 		}
 		return map[string]bool{"ok": true}, true, nil
@@ -364,11 +425,16 @@ func createSession(ctx context.Context, manager *synchronization.Manager, defini
 	}
 	configuration := &synchronization.Configuration{SynchronizationMode: definition.Mode}
 	policy := definition.ContentPolicy
-	if len(policy.ExtraIgnorePatterns) > 256 || len(policy.ExtraIncludePatterns) > 256 {
-		return "", errors.New("invalid content policy")
+	if err := validateContentPolicy(policy); err != nil {
+		return "", err
 	}
-	if policy.IncludeGitDirectory {
-		return "", errors.New("includeGitDirectory is unsupported for continuous synchronization")
+	if len(definition.Labels) > 16 {
+		return "", errors.New("invalid session labels")
+	}
+	for key, value := range definition.Labels {
+		if !validIdentifier(key) || value == "" || len(value) > MaximumIdentifierBytes {
+			return "", errors.New("invalid session labels")
+		}
 	}
 	switch policy.Selection {
 	case "git_worktree":
@@ -389,33 +455,268 @@ func createSession(ctx context.Context, manager *synchronization.Manager, defini
 	return manager.Create(ctx, alpha, beta, configuration, &synchronization.Configuration{}, &synchronization.Configuration{}, definition.Name, definition.Labels, true, "")
 }
 
-func projectConflicts(conflicts []synchronizationapi.Conflict, excluded uint64, limit int) conflictProjection {
-	shown := conflicts
-	if len(shown) > limit {
-		shown = shown[:limit]
+func validateContentPolicy(policy contentPolicy) error {
+	if len(policy.ExtraIgnorePatterns) > maximumContentPolicyPatterns || len(policy.ExtraIncludePatterns) > maximumContentPolicyPatterns {
+		return errors.New("invalid content policy")
 	}
-	total := len(conflicts) + int(excluded)
-	return conflictProjection{
-		TotalCount: total, ShownCount: len(shown),
-		TruncatedCount: total - len(shown), Conflicts: shown,
+	for _, patterns := range [][]string{policy.ExtraIgnorePatterns, policy.ExtraIncludePatterns} {
+		for _, pattern := range patterns {
+			if len(pattern) == 0 || len(pattern) > maximumContentPolicyPatternBytes {
+				return errors.New("invalid content policy pattern")
+			}
+		}
 	}
+	for _, pattern := range policy.ExtraIncludePatterns {
+		if strings.HasPrefix(pattern, "!") {
+			return errors.New("invalid positive content policy include pattern")
+		}
+	}
+	return nil
 }
 
-func getSession(ctx context.Context, manager *synchronization.Manager, identifier string) (synchronizationapi.Session, error) {
-	result, found, err := findSession(ctx, manager, identifier)
-	if err != nil {
-		return synchronizationapi.Session{}, err
+func conflictViewFingerprint(conflicts []synchronizationapi.Conflict, excluded uint64) string {
+	payload, _ := json.Marshal(struct {
+		Excluded  uint64                        `json:"excluded"`
+		Conflicts []synchronizationapi.Conflict `json:"conflicts"`
+	}{excluded, conflicts})
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:8])
+}
+
+func parseConflictCursor(cursor, fingerprint string, maximum int) (int, error) {
+	if cursor == "" {
+		return 0, nil
 	}
-	if !found {
-		return synchronizationapi.Session{}, errors.New("unexpected selected session count")
+	parts := strings.Split(cursor, "_")
+	if len(parts) != 3 || parts[0] != "c1" || parts[1] != fingerprint {
+		return 0, newBrokerResponseError("cursor_invalidated", "conflict view changed; refresh required")
+	}
+	offset, err := strconv.Atoi(parts[2])
+	if err != nil || offset < 0 || offset > maximum {
+		return 0, newBrokerResponseError("cursor_invalidated", "conflict view changed; refresh required")
+	}
+	return offset, nil
+}
+
+func projectConflictPage(requestID string, conflicts []synchronizationapi.Conflict, excluded uint64, cursor string, limit int) (conflictProjection, error) {
+	sorted := append([]synchronizationapi.Conflict(nil), conflicts...)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].Root != sorted[j].Root {
+			return sorted[i].Root < sorted[j].Root
+		}
+		left, _ := json.Marshal(sorted[i])
+		right, _ := json.Marshal(sorted[j])
+		return string(left) < string(right)
+	})
+	fingerprint := conflictViewFingerprint(sorted, excluded)
+	offset, err := parseConflictCursor(cursor, fingerprint, len(sorted))
+	if err != nil {
+		return conflictProjection{}, err
+	}
+	total := len(conflicts) + int(excluded)
+	result := conflictProjection{
+		TotalCount: total,
+		Conflicts:  make([]synchronizationapi.Conflict, 0, min(len(sorted)-offset, limit)),
+	}
+	for _, conflict := range sorted[offset:] {
+		if len(result.Conflicts) == limit {
+			break
+		}
+		candidate := result
+		candidate.Conflicts = append(append([]synchronizationapi.Conflict(nil), result.Conflicts...), conflict)
+		candidate.ShownCount = len(candidate.Conflicts)
+		candidate.TruncatedCount = total - offset - candidate.ShownCount
+		if offset+candidate.ShownCount < len(sorted) {
+			next := fmt.Sprintf("c1_%s_%d", fingerprint, offset+candidate.ShownCount)
+			candidate.NextCursor = &next
+		}
+		if !resultFitsControlFrame(requestID, candidate) {
+			break
+		}
+		result = candidate
+	}
+	result.ShownCount = len(result.Conflicts)
+	result.TruncatedCount = total - offset - result.ShownCount
+	if offset+result.ShownCount < len(sorted) {
+		next := fmt.Sprintf("c1_%s_%d", fingerprint, offset+result.ShownCount)
+		result.NextCursor = &next
+	}
+	if len(sorted) > offset && result.ShownCount == 0 {
+		return conflictProjection{}, newBrokerResponseError("protocol_error", "one conflict cannot fit the response frame")
 	}
 	return result, nil
 }
 
-func findSession(ctx context.Context, manager *synchronization.Manager, identifier string) (synchronizationapi.Session, bool, error) {
+func summarizeSession(state *synchronization.State) sessionSummary {
+	endpoint := func(endpointURL *url.URL, endpointState *synchronization.EndpointState) sessionEndpointSummary {
+		result := sessionEndpointSummary{Protocol: endpointURL.Protocol, Host: endpointURL.Host, Path: endpointURL.Path}
+		if endpointState != nil {
+			result.Connected = endpointState.Connected
+			result.Scanned = endpointState.Scanned
+		}
+		return result
+	}
+	configuration := state.Session.Configuration
+	labels := state.Session.Labels
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+	return sessionSummary{
+		Identifier:       state.Session.Identifier,
+		Name:             state.Session.Name,
+		Labels:           labels,
+		Alpha:            endpoint(state.Session.Alpha, state.AlphaState),
+		Beta:             endpoint(state.Session.Beta, state.BetaState),
+		Mode:             configuration.SynchronizationMode,
+		Paused:           state.Session.Paused,
+		Status:           state.Status,
+		SuccessfulCycles: state.SuccessfulCycles,
+		ConflictCount:    uint64(len(state.Conflicts)) + state.ExcludedConflicts,
+		LastError:        boundedResponseString(state.LastError, 4096),
+	}
+}
+
+func projectPolicyPage(requestID string, state *synchronization.State, cursor string, limit int) (policyPage, bool, error) {
+	// Configuration.Ignores is the exact caller-supplied policy materialized by
+	// createSession. DefaultIgnores is engine-owned and must not enter recovery.
+	patterns := append([]string(nil), state.Session.Configuration.Ignores...)
+	selection := "all_files"
+	switch state.Session.Configuration.IgnoreSyntax {
+	case ignore.Syntax_SyntaxDefault, ignore.Syntax_SyntaxMutagen:
+	case ignore.Syntax_SyntaxGitWorktree:
+		selection = "git_worktree"
+	default:
+		return policyPage{}, false, newBrokerResponseError("protocol_error", "unsupported persisted policy selection")
+	}
+	fingerprint := policyViewFingerprint(selection, patterns)
+	offset, err := parsePolicyCursor(cursor, fingerprint, len(patterns))
+	if err != nil {
+		return policyPage{}, false, err
+	}
+	result := policyPage{Selection: selection, Patterns: make([]string, 0, min(len(patterns)-offset, limit))}
+	for _, pattern := range patterns[offset:] {
+		if len(result.Patterns) == limit {
+			break
+		}
+		candidate := result
+		candidate.Patterns = append(append([]string(nil), result.Patterns...), pattern)
+		if offset+len(candidate.Patterns) < len(patterns) {
+			next := fmt.Sprintf("p1_%s_%d", fingerprint, offset+len(candidate.Patterns))
+			candidate.NextCursor = &next
+		}
+		if !resultFitsControlFrame(requestID, candidate) {
+			break
+		}
+		result = candidate
+	}
+	if len(patterns) > offset && len(result.Patterns) == 0 {
+		return policyPage{}, false, newBrokerResponseError("protocol_error", "one policy pattern cannot fit the response frame")
+	}
+	return result, false, nil
+}
+
+func policyViewFingerprint(selection string, patterns []string) string {
+	payload, _ := json.Marshal(struct {
+		Selection string   `json:"selection"`
+		Patterns  []string `json:"patterns"`
+	}{selection, patterns})
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:8])
+}
+
+func parsePolicyCursor(cursor, fingerprint string, maximum int) (int, error) {
+	if cursor == "" {
+		return 0, nil
+	}
+	parts := strings.Split(cursor, "_")
+	if len(parts) != 3 || parts[0] != "p1" || parts[1] != fingerprint {
+		return 0, newBrokerResponseError("cursor_invalidated", "policy view changed; refresh required")
+	}
+	offset, err := strconv.Atoi(parts[2])
+	if err != nil || offset < 0 || offset > maximum {
+		return 0, newBrokerResponseError("cursor_invalidated", "policy view changed; refresh required")
+	}
+	return offset, nil
+}
+
+func projectSessionPage(requestID string, states []*synchronization.State, cursor string, limit int) (sessionListPage, error) {
+	sorted := append([]*synchronization.State(nil), states...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Session.Identifier < sorted[j].Session.Identifier })
+	identifiers := make([]string, len(sorted))
+	for index, state := range sorted {
+		identifiers[index] = state.Session.Identifier
+	}
+	fingerprint := sessionViewFingerprint(identifiers)
+	offset, err := parseSessionCursor(cursor, fingerprint, len(sorted))
+	if err != nil {
+		return sessionListPage{}, err
+	}
+	eligible := sorted[offset:]
+	result := sessionListPage{Sessions: make([]sessionSummary, 0, min(len(eligible), limit))}
+	for index, state := range eligible {
+		if index == limit {
+			break
+		}
+		candidate := result
+		candidate.Sessions = append(append([]sessionSummary(nil), result.Sessions...), summarizeSession(state))
+		if offset+index+1 < len(sorted) {
+			next := fmt.Sprintf("s1_%s_%d", fingerprint, offset+index+1)
+			candidate.NextCursor = &next
+		} else {
+			candidate.NextCursor = nil
+		}
+		if !resultFitsControlFrame(requestID, candidate) {
+			if len(result.Sessions) == 0 {
+				return sessionListPage{}, newBrokerResponseError("protocol_error", "session summary exceeds response frame limit")
+			}
+			break
+		}
+		result = candidate
+	}
+	return result, nil
+}
+
+func sessionViewFingerprint(identifiers []string) string {
+	payload, _ := json.Marshal(identifiers)
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:8])
+}
+
+func parseSessionCursor(cursor, fingerprint string, maximum int) (int, error) {
+	if cursor == "" {
+		return 0, nil
+	}
+	parts := strings.Split(cursor, "_")
+	if len(parts) != 3 || parts[0] != "s1" || parts[1] != fingerprint {
+		return 0, newBrokerResponseError("cursor_invalidated", "session view changed; refresh required")
+	}
+	offset, err := strconv.Atoi(parts[2])
+	if err != nil || offset < 0 || offset > maximum {
+		return 0, newBrokerResponseError("cursor_invalidated", "session view changed; refresh required")
+	}
+	return offset, nil
+}
+
+func resultFitsControlFrame(requestID string, result any) bool {
+	payload, err := json.Marshal(map[string]any{"t": "result", "requestId": requestID, "result": result})
+	return err == nil && len(payload) <= MaximumControlFrameBytes
+}
+
+func getSession(ctx context.Context, manager *synchronization.Manager, identifier string) (sessionSummary, error) {
+	result, found, err := findSession(ctx, manager, identifier)
+	if err != nil {
+		return sessionSummary{}, err
+	}
+	if !found {
+		return sessionSummary{}, errors.New("unexpected selected session count")
+	}
+	return result, nil
+}
+
+func findSession(ctx context.Context, manager *synchronization.Manager, identifier string) (sessionSummary, bool, error) {
 	_, states, err := manager.List(ctx, &selection.Selection{All: true}, 0)
 	if err != nil {
-		return synchronizationapi.Session{}, false, err
+		return sessionSummary{}, false, err
 	}
 	matches := states[:0]
 	for _, state := range states {
@@ -424,10 +725,10 @@ func findSession(ctx context.Context, manager *synchronization.Manager, identifi
 		}
 	}
 	if len(matches) == 0 {
-		return synchronizationapi.Session{}, false, nil
+		return sessionSummary{}, false, nil
 	}
 	if len(matches) != 1 {
-		return synchronizationapi.Session{}, false, errors.New("unexpected selected session count")
+		return sessionSummary{}, false, errors.New("unexpected selected session count")
 	}
-	return synchronizationapi.ExportSessions(matches)[0], true, nil
+	return summarizeSession(matches[0]), true, nil
 }

@@ -48,43 +48,87 @@ func ServeEndpoint(logger *logging.Logger, stream io.ReadWriteCloser) error {
 // endpoint agent to enforce target-owned path authorization independently of
 // the remote controller's initialization request.
 func ServeEndpointAtRoot(logger *logging.Logger, stream io.ReadWriteCloser, root string) error {
-	root, err := ValidateEndpointRoot(root)
+	validatedRoot, err := validateEndpointRootIdentity(root)
 	if err != nil {
 		stream.Close()
 		return err
 	}
-	return serveEndpoint(logger, stream, root)
+	return serveEndpointAtValidatedRoot(logger, stream, validatedRoot)
+}
+
+// validatedEndpointRoot binds a rooted endpoint to the filesystem object that
+// was authorized before the protocol handshake. The object is revalidated at
+// the final endpoint-creation boundary so that a pathname replacement during
+// the handshake cannot redirect synchronization to a different directory.
+type validatedEndpointRoot struct {
+	path string
+	info os.FileInfo
 }
 
 // ValidateEndpointRoot resolves and validates the target-owned root used by a
 // rooted agent. It rejects missing, inaccessible, non-directory, and symlink
 // roots before any protocol handshake and returns the canonical real path.
 func ValidateEndpointRoot(root string) (string, error) {
+	validated, err := validateEndpointRootIdentity(root)
+	if err != nil {
+		return "", err
+	}
+	return validated.path, nil
+}
+
+func validateEndpointRootIdentity(root string) (validatedEndpointRoot, error) {
 	if root == "" {
-		return "", errors.New("empty enforced synchronization root")
+		return validatedEndpointRoot{}, errors.New("empty enforced synchronization root")
 	}
 	normalizedRoot, err := filesystem.Normalize(root)
 	if err != nil {
-		return "", fmt.Errorf("unable to normalize enforced synchronization root: %w", err)
+		return validatedEndpointRoot{}, fmt.Errorf("unable to normalize enforced synchronization root: %w", err)
 	}
 	metadata, err := os.Lstat(normalizedRoot)
 	if err != nil {
-		return "", fmt.Errorf("unable to inspect enforced synchronization root: %w", err)
+		return validatedEndpointRoot{}, fmt.Errorf("unable to inspect enforced synchronization root: %w", err)
 	}
 	if metadata.Mode()&os.ModeSymlink != 0 {
-		return "", errors.New("enforced synchronization root must not be a symbolic link")
+		return validatedEndpointRoot{}, errors.New("enforced synchronization root must not be a symbolic link")
 	}
 	if !metadata.IsDir() {
-		return "", errors.New("enforced synchronization root must be a directory")
+		return validatedEndpointRoot{}, errors.New("enforced synchronization root must be a directory")
 	}
 	realRoot, err := filepath.EvalSymlinks(normalizedRoot)
 	if err != nil {
-		return "", fmt.Errorf("unable to resolve enforced synchronization root: %w", err)
+		return validatedEndpointRoot{}, fmt.Errorf("unable to resolve enforced synchronization root: %w", err)
 	}
-	return filesystem.Normalize(realRoot)
+	realRoot, err = filesystem.Normalize(realRoot)
+	if err != nil {
+		return validatedEndpointRoot{}, fmt.Errorf("unable to normalize resolved synchronization root: %w", err)
+	}
+	metadata, err = os.Stat(realRoot)
+	if err != nil {
+		return validatedEndpointRoot{}, fmt.Errorf("unable to inspect resolved synchronization root: %w", err)
+	}
+	return validatedEndpointRoot{path: realRoot, info: metadata}, nil
+}
+
+func revalidateEndpointRootIdentity(root validatedEndpointRoot) (string, error) {
+	current, err := validateEndpointRootIdentity(root.path)
+	if err != nil {
+		return "", err
+	}
+	if current.path != root.path || !os.SameFile(root.info, current.info) {
+		return "", errors.New("enforced synchronization root changed during initialization")
+	}
+	return current.path, nil
+}
+
+func serveEndpointAtValidatedRoot(logger *logging.Logger, stream io.ReadWriteCloser, root validatedEndpointRoot) error {
+	return serveEndpointWithRoot(logger, stream, root.path, &root)
 }
 
 func serveEndpoint(logger *logging.Logger, stream io.ReadWriteCloser, enforcedRoot string) error {
+	return serveEndpointWithRoot(logger, stream, enforcedRoot, nil)
+}
+
+func serveEndpointWithRoot(logger *logging.Logger, stream io.ReadWriteCloser, enforcedRoot string, validatedRoot *validatedEndpointRoot) error {
 	// Perform the compression handshake.
 	compressionAlgorithm, err := compression.ServerHandshake(stream)
 	if err != nil {
@@ -162,6 +206,16 @@ func serveEndpoint(logger *logging.Logger, stream io.ReadWriteCloser, enforcedRo
 		encoder.Encode(&InitializeSynchronizationResponse{Error: err.Error()})
 		flusher.Flush()
 		return err
+	}
+	if validatedRoot != nil {
+		revalidatedRoot, err := revalidateEndpointRootIdentity(*validatedRoot)
+		if err != nil {
+			err = fmt.Errorf("unable to revalidate enforced synchronization root: %w", err)
+			encoder.Encode(&InitializeSynchronizationResponse{Error: err.Error()})
+			flusher.Flush()
+			return err
+		}
+		request.Root = revalidatedRoot
 	}
 
 	// Create the underlying endpoint. If it fails to create, then send a
