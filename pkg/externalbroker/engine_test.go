@@ -119,6 +119,17 @@ func TestConflictPaginationExhaustsStablePagesAndRejectsAChangedView(t *testing.
 	}
 }
 
+func TestConflictPaginationClearsCursorWhenExactFitFinalPageHasMultipleItems(t *testing.T) {
+	conflicts := []synchronizationapi.Conflict{{Root: "b"}, {Root: "a"}}
+	page, err := projectConflictPage("request-01", conflicts, 0, "", 2)
+	if err != nil {
+		t.Fatal("unable to project exact-fit conflict page:", err)
+	}
+	if page.ShownCount != 2 || page.TruncatedCount != 0 || page.NextCursor != nil {
+		t.Fatalf("exact-fit final conflict page retained a continuation cursor: %+v", page)
+	}
+}
+
 func compactSessionState(identifier string) *synchronization.State {
 	return &synchronization.State{
 		Session: &synchronization.Session{
@@ -204,6 +215,19 @@ func TestPolicyPageProjectsGitWorktreeSelectionOutOfBand(t *testing.T) {
 	page, _, err := projectPolicyPage("request-01", state, "", 100)
 	if err != nil || page.Selection != "git_worktree" || len(page.Patterns) != 3 || page.Patterns[0] != "build/" {
 		t.Fatalf("Git selector was not projected independently of ignore patterns: %+v (%v)", page, err)
+	}
+}
+
+func TestPolicyPaginationClearsCursorWhenExactFitFinalPageHasMultipleItems(t *testing.T) {
+	state := compactSessionState("session-git-policy-exact-fit")
+	state.Session.Configuration.IgnoreSyntax = ignore.Syntax_SyntaxGitWorktree
+	state.Session.Configuration.Ignores = []string{"build/", ".git/"}
+	page, _, err := projectPolicyPage("request-01", state, "", 2)
+	if err != nil {
+		t.Fatal("unable to project exact-fit policy page:", err)
+	}
+	if len(page.Patterns) != 2 || page.NextCursor != nil {
+		t.Fatalf("exact-fit final policy page retained a continuation cursor: %+v", page)
 	}
 }
 

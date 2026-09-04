@@ -529,6 +529,8 @@ func projectConflictPage(requestID string, conflicts []synchronizationapi.Confli
 		if offset+candidate.ShownCount < len(sorted) {
 			next := fmt.Sprintf("c1_%s_%d", fingerprint, offset+candidate.ShownCount)
 			candidate.NextCursor = &next
+		} else {
+			candidate.NextCursor = nil
 		}
 		if !resultFitsControlFrame(requestID, candidate) {
 			break
@@ -540,6 +542,8 @@ func projectConflictPage(requestID string, conflicts []synchronizationapi.Confli
 	if offset+result.ShownCount < len(sorted) {
 		next := fmt.Sprintf("c1_%s_%d", fingerprint, offset+result.ShownCount)
 		result.NextCursor = &next
+	} else {
+		result.NextCursor = nil
 	}
 	if len(sorted) > offset && result.ShownCount == 0 {
 		return conflictProjection{}, newBrokerResponseError("protocol_error", "one conflict cannot fit the response frame")
@@ -603,6 +607,8 @@ func projectPolicyPage(requestID string, state *synchronization.State, cursor st
 		if offset+len(candidate.Patterns) < len(patterns) {
 			next := fmt.Sprintf("p1_%s_%d", fingerprint, offset+len(candidate.Patterns))
 			candidate.NextCursor = &next
+		} else {
+			candidate.NextCursor = nil
 		}
 		if !resultFitsControlFrame(requestID, candidate) {
 			break
