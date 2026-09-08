@@ -2,6 +2,7 @@ package externalbroker
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/endpoint/remote"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/gitworktree"
 	externalprotocol "github.com/mutagen-io/mutagen/pkg/synchronization/protocols/external"
 	"github.com/mutagen-io/mutagen/pkg/url"
 )
@@ -68,6 +70,56 @@ func TestCommandDecoderRejectsProductOwnedConflictMutation(t *testing.T) {
 	}
 }
 
+func TestCreateSessionReturnsTypedGitSelectionUnavailable(t *testing.T) {
+	definition := sessionDefinition{
+		Name:  "session-1",
+		Alpha: "external://alpha",
+		Beta:  "external://beta",
+		Mode:  core.SynchronizationMode_SynchronizationModeOneWaySafe,
+		ContentPolicy: contentPolicy{
+			Selection: "unsupported",
+		},
+	}
+	_, err := createSession(context.Background(), nil, definition)
+	if err == nil {
+		t.Fatal("invalid Git selection unexpectedly succeeded")
+	}
+	coded, ok := err.(interface{ BrokerCode() string })
+	if !ok || coded.BrokerCode() != "git_selection_unavailable" {
+		t.Fatalf("create-time failure was not typed: %v", err)
+	}
+}
+
+func TestBrokerResultPreservesWrappedGitSelectionFailure(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	if err := server.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	broker := &BrokerClient{connection: client}
+	done := make(chan error, 1)
+	go func() {
+		done <- broker.SendResult("resume-1", nil, fmt.Errorf("unable to resume: %w", gitworktree.SelectionUnavailableError("repository unavailable")))
+	}()
+	raw, err := readControlFrame(bufio.NewReader(server))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != "git_selection_unavailable" {
+		t.Fatalf("broker discarded typed endpoint failure: %s", raw)
+	}
+}
+
 func TestConflictProjectionReportsHonestBoundedCounts(t *testing.T) {
 	projection, err := projectConflictPage("request-01", []synchronizationapi.Conflict{{Root: "c"}, {Root: "a"}, {Root: "b"}}, 2, "", 2)
 	if err != nil {
@@ -98,6 +150,83 @@ func TestConflictProjectionFitsControlFrameAndPreservesCounts(t *testing.T) {
 	}
 	if !resultFitsControlFrame("request-01", projection) {
 		t.Fatal("projected conflicts exceed the broker control frame")
+	}
+}
+
+func TestConflictProjectionCompactsLargeDirectoryToConsumedRootState(t *testing.T) {
+	contents := make(map[string]*synchronizationapi.Entry, 10_000)
+	for index := 0; index < 10_000; index++ {
+		contents[fmt.Sprintf("nested-%05d", index)] = &synchronizationapi.Entry{
+			Kind:      core.EntryKind_File,
+			FileEntry: &synchronizationapi.FileEntry{Digest: strings.Repeat("a", 40)},
+		}
+	}
+	conflicts := []synchronizationapi.Conflict{{
+		Root: "large-directory",
+		AlphaChanges: []synchronizationapi.Change{{
+			Path: "large-directory",
+			New: &synchronizationapi.Entry{
+				Kind:           core.EntryKind_Directory,
+				DirectoryEntry: &synchronizationapi.DirectoryEntry{Contents: contents},
+			},
+		}},
+		BetaChanges: []synchronizationapi.Change{{
+			Path: "large-directory",
+			New: &synchronizationapi.Entry{
+				Kind:      core.EntryKind_File,
+				FileEntry: &synchronizationapi.FileEntry{Digest: strings.Repeat("b", 40)},
+			},
+		}},
+	}}
+
+	projection, err := projectConflictPage("request-large-directory", conflicts, 0, "", 1)
+	if err != nil {
+		t.Fatal("large-directory conflict could not be listed:", err)
+	}
+	if projection.TotalCount != 1 || projection.ShownCount != 1 || projection.TruncatedCount != 0 || projection.NextCursor != nil {
+		t.Fatalf("large-directory conflict counts were not truthful: %+v", projection)
+	}
+	conflict := projection.Conflicts[0]
+	if conflict.Root != "large-directory" || len(conflict.AlphaChanges) != 1 || len(conflict.BetaChanges) != 1 {
+		t.Fatalf("large-directory conflict lost its stable selectable identity or root endpoint changes: %+v", conflict)
+	}
+	if alpha := conflict.AlphaChanges[0].New; alpha == nil || alpha.Kind != "directory" || alpha.Digest != "" {
+		t.Fatalf("large directory endpoint was not compacted to its consumed root state: %+v", alpha)
+	}
+	if beta := conflict.BetaChanges[0].New; beta == nil || beta.Kind != "file" || beta.Digest != strings.Repeat("b", 40) {
+		t.Fatalf("file endpoint was not compacted to its consumed root state: %+v", beta)
+	}
+	encoded, err := json.Marshal(projection)
+	if err != nil {
+		t.Fatal("unable to encode compact conflict projection:", err)
+	}
+	if bytes.Contains(encoded, []byte("nested-")) || !bytes.Contains(encoded, []byte(`"root":"large-directory"`)) {
+		t.Fatalf("conflict projection did not retain only root endpoint state: %s", encoded)
+	}
+	if !resultFitsControlFrame("request-large-directory", projection) {
+		t.Fatal("compact large-directory conflict exceeds the broker control frame")
+	}
+}
+
+func TestConflictProjectionUsesDirectoryRootForDescendantChanges(t *testing.T) {
+	projection, err := projectConflictPage("request-descendants", []synchronizationapi.Conflict{{
+		Root: "directory",
+		AlphaChanges: []synchronizationapi.Change{
+			{Path: "directory/first", New: &synchronizationapi.Entry{Kind: core.EntryKind_File,
+				FileEntry: &synchronizationapi.FileEntry{Digest: strings.Repeat("a", 40)}}},
+			{Path: "directory/second", New: &synchronizationapi.Entry{Kind: core.EntryKind_File,
+				FileEntry: &synchronizationapi.FileEntry{Digest: strings.Repeat("b", 40)}}},
+		},
+		BetaChanges: []synchronizationapi.Change{{Path: "directory", New: &synchronizationapi.Entry{
+			Kind: core.EntryKind_File, FileEntry: &synchronizationapi.FileEntry{Digest: strings.Repeat("c", 40)},
+		}}},
+	}}, 0, "", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alpha := projection.Conflicts[0].AlphaChanges[0]
+	if alpha.Path != "directory" || alpha.New == nil || alpha.New.Kind != "directory" || alpha.New.Digest != "" {
+		t.Fatalf("descendant file state was misrepresented as conflict root: %+v", alpha)
 	}
 }
 
@@ -541,7 +670,22 @@ func TestServeEngineAcknowledgesShutdownOnlyAfterManagerShutdownCompletes(t *tes
 type commandTestDialer struct{ alpha, beta string }
 
 func (d commandTestDialer) Dial(_ context.Context, request externalprotocol.DialRequest) (io.ReadWriteCloser, error) {
-	client, server := net.Pipe()
+	// Endpoint initialization exchanges concurrent final writes on failure;
+	// match real buffered transports rather than net.Pipe's synchronous writes.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+	defer listener.Close()
+	client, err := net.Dial(listener.Addr().Network(), listener.Addr().String())
+	if err != nil {
+		return nil, err
+	}
+	server, err := listener.Accept()
+	if err != nil {
+		client.Close()
+		return nil, err
+	}
 	root := d.alpha
 	if request.EndpointIdentifier == "opaque-beta" {
 		root = d.beta
@@ -558,6 +702,45 @@ func (d commandTestDialer) Dial(_ context.Context, request externalprotocol.Dial
 		_ = remote.ServeEndpointAtRoot(nil, server, root)
 	}()
 	return client, nil
+}
+
+func TestEngineReconnectReportsGitSelectionFailure(t *testing.T) {
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
+	previous := synchronization.ProtocolHandlers[url.Protocol_External]
+	defer func() { synchronization.ProtocolHandlers[url.Protocol_External] = previous }()
+	manager, err := NewEngineManager(nil, commandTestDialer{alpha: t.TempDir(), beta: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Shutdown()
+	identifier, err := createSession(context.Background(), manager, sessionDefinition{
+		Name: "git-unavailable", Alpha: "external://opaque-alpha", Beta: "external://opaque-beta",
+		Mode:          core.SynchronizationMode_SynchronizationModeOneWaySafe,
+		ContentPolicy: contentPolicy{Selection: "git_worktree"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = executeCommand(context.Background(), manager, commandFrame(t, "resume-1", map[string]any{
+		"t": "resume", "requestId": "resume-1", "sessionIdentifier": identifier,
+	}))
+	if !gitworktree.IsSelectionUnavailable(err) {
+		t.Fatalf("resume lost typed failure: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		status, err := getSession(context.Background(), manager, identifier)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.LastErrorCode == "git_selection_unavailable" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("reconnecting session lost typed failure: %+v", status)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func TestManagerCommandResponsesUseCompactSessionSummariesAndPagedList(t *testing.T) {
@@ -632,6 +815,24 @@ func TestManagerCommandResponsesUseCompactSessionSummariesAndPagedList(t *testin
 		t.Fatal("terminate command failed:", err)
 	} else if acknowledged, ok := result.(map[string]bool); !ok || !acknowledged["ok"] {
 		t.Fatalf("terminate was not acknowledged: %#v", result)
+	}
+}
+
+func TestSummarizeSessionCarriesTypedGitSelectionFailure(t *testing.T) {
+	state := &synchronization.State{
+		LastError:     "alpha scan error: diagnostic text is not an API",
+		LastErrorCode: "git_selection_unavailable",
+		Session: &synchronization.Session{
+			Identifier:    "session-1",
+			Name:          "session-1",
+			Alpha:         &url.URL{Protocol: url.Protocol_External, Host: "alpha"},
+			Beta:          &url.URL{Protocol: url.Protocol_External, Host: "beta"},
+			Configuration: &synchronization.Configuration{},
+		},
+	}
+	summary := summarizeSession(state)
+	if summary.LastErrorCode != "git_selection_unavailable" {
+		t.Fatalf("typed error code was not preserved: %#v", summary)
 	}
 }
 

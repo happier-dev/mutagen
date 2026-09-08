@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/mutagen-io/mutagen/pkg/synchronization/gitworktree"
 	externalprotocol "github.com/mutagen-io/mutagen/pkg/synchronization/protocols/external"
 )
 
@@ -282,8 +283,11 @@ func (c *BrokerClient) Dial(ctx context.Context, request externalprotocol.DialRe
 func (c *BrokerClient) SendResult(requestID string, result any, commandError error) error {
 	if commandError != nil {
 		code := "engine_unavailable"
-		if coded, ok := commandError.(interface{ BrokerCode() string }); ok {
+		var coded interface{ BrokerCode() string }
+		if errors.As(commandError, &coded) {
 			code = coded.BrokerCode()
+		} else if gitworktree.IsSelectionUnavailable(commandError) {
+			code = "git_selection_unavailable"
 		}
 		return c.write(map[string]any{
 			"t": "error", "requestId": requestID,

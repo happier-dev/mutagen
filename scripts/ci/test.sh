@@ -20,6 +20,11 @@ else
     go test -p 1 -v -coverpkg=./pkg/... -coverprofile=coverage.txt ./pkg/...
 fi
 
+# The rooted external-agent contract lives in the tagged command package, not
+# ./pkg/.... It is mandatory because these tests exercise the packaged agent
+# binary and the in-process synchronizer guard used by Happier.
+go test -v -tags mutagenagent,mutagensspl ./cmd/mutagen-agent
+
 # Run tests with the race detector enabled. We use a slim end-to-end test since
 # the race detector significantly increases the execution time.
 if [[ "${MUTAGEN_TEST_ENABLE_SSPL}" == "true" ]]; then

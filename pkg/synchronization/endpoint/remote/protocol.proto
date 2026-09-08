@@ -31,6 +31,8 @@ message InitializeSynchronizationRequest {
 message InitializeSynchronizationResponse {
     // Error is the error message (if any) resulting from initialization.
     string error = 1;
+    // ErrorCode is optional typed failure metadata; unknown codes remain errors.
+    string errorCode = 2;
 }
 
 // PollRequest encodes a request for one-shot polling.
@@ -69,6 +71,8 @@ message ScanResponse {
     string error = 2;
     // TryAgain indicates whether or not the error is ephermeral.
     bool tryAgain = 3;
+    // ErrorCode is optional typed failure metadata; unknown codes remain errors.
+    string errorCode = 4;
 }
 
 // StageRequest encodes a request for staging.

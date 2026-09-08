@@ -192,6 +192,14 @@ jobs:
           else
             tar -C dist -czf "${root}.tar.gz" "$(basename "${root}")"
           fi
+      - name: Test native external engine and rooted agent
+        shell: bash
+        env:
+          CGO_ENABLED: ${{ matrix.cgo }}
+        run: |
+          set -euo pipefail
+          go test -tags mutagensspl ./pkg/externalbroker ./pkg/synchronization/endpoint/remote ./pkg/synchronization/gitworktree
+          go test -tags mutagenagent,mutagensspl ./cmd/mutagen-agent
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: engine-${{ matrix.target }}
@@ -208,6 +216,29 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+      - name: Refuse release overwrite
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          bash scripts/ci/validate_release_tag.sh "${GITHUB_REF_NAME}"
+          # The trigger tag necessarily exists; immutability requires that it
+          # resolves to this checkout and that no publication state exists yet.
+          test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "${GITHUB_REF_NAME}")"
+          set +e
+          release_response="$(gh api --include "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" 2>&1)"
+          release_status=$?
+          set -e
+          if [[ "${release_status}" -eq 0 ]]; then
+            echo "existing release or assets refuse immutable publication: ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+          if ! grep -Eq '^HTTP/[0-9.]+ 404' <<<"${release_response}"; then
+            echo "unable to prove release absence for ${GITHUB_REF_NAME}" >&2
+            printf '%s\n' "${release_response}" >&2
+            exit 1
+          fi
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: engine-*

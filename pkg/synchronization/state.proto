@@ -129,4 +129,7 @@ message State {
     EndpointState alphaState = 7;
     // BetaState encodes the state of the beta endpoint. It is always non-nil.
     EndpointState betaState = 8;
+    // LastErrorCode classifies the last failure without parsing diagnostic prose.
+    // It is cleared with LastError after synchronization resumes.
+    string lastErrorCode = 9;
 }

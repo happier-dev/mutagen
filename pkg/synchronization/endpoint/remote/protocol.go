@@ -3,7 +3,23 @@ package remote
 import (
 	"errors"
 	"fmt"
+
+	"github.com/mutagen-io/mutagen/pkg/synchronization/gitworktree"
 )
+
+func endpointErrorCode(err error) string {
+	if gitworktree.IsSelectionUnavailable(err) {
+		return "git_selection_unavailable"
+	}
+	return ""
+}
+
+func decodeEndpointError(code, message string) error {
+	if code == "git_selection_unavailable" {
+		return gitworktree.SelectionUnavailableError(message)
+	}
+	return fmt.Errorf("remote error: %s", message)
+}
 
 const (
 	// controlStreamBufferSize is the buffer size to use for control stream

@@ -70,11 +70,29 @@ func TestHappierReleasePreservesMixedLicenseBuildContract(t *testing.T) {
 			t.Errorf("release source test job is missing %q", command)
 		}
 	}
+	buildCommands := ""
+	for _, step := range parsedWorkflow.Jobs["build"].Steps {
+		buildCommands += step.Run
+	}
+	for _, command := range []string{
+		"go test -tags mutagensspl ./pkg/externalbroker ./pkg/synchronization/endpoint/remote ./pkg/synchronization/gitworktree",
+		"go test -tags mutagenagent,mutagensspl ./cmd/mutagen-agent",
+	} {
+		if !strings.Contains(buildCommands, command) {
+			t.Errorf("native release target does not test its runtime contract: %q", command)
+		}
+	}
 	var setupStep *releaseWorkflowStep
 	var setupStepIndex = -1
+	var preflightStep *releaseWorkflowStep
+	var preflightStepIndex = -1
 	var signingStep *releaseWorkflowStep
 	var signingStepIndex = -1
 	for index := range publishJob.Steps {
+		if publishJob.Steps[index].Name == "Refuse release overwrite" {
+			preflightStep = &publishJob.Steps[index]
+			preflightStepIndex = index
+		}
 		if publishJob.Steps[index].Name == "Set up checksum-verified Minisign" {
 			setupStep = &publishJob.Steps[index]
 			setupStepIndex = index
@@ -82,6 +100,22 @@ func TestHappierReleasePreservesMixedLicenseBuildContract(t *testing.T) {
 		if publishJob.Steps[index].Name == "Sign aggregate checksums" {
 			signingStep = &publishJob.Steps[index]
 			signingStepIndex = index
+		}
+	}
+	if preflightStep == nil {
+		t.Fatal("publish job has no release overwrite preflight")
+	}
+	if preflightStepIndex >= signingStepIndex {
+		t.Fatal("release overwrite preflight must precede signing")
+	}
+	for _, requiredCommand := range []string{
+		`test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "${GITHUB_REF_NAME}")"`,
+		`gh api --include "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}"`,
+		`existing release or assets refuse immutable publication`,
+		`grep -Eq '^HTTP/[0-9.]+ 404'`,
+	} {
+		if !strings.Contains(preflightStep.Run, requiredCommand) {
+			t.Errorf("release overwrite preflight is missing %q", requiredCommand)
 		}
 	}
 	if setupStep == nil {
@@ -232,6 +266,17 @@ func TestHappierReleasePreservesMixedLicenseBuildContract(t *testing.T) {
 	}
 	if upstreamRelease.If != "github.ref_type == 'tag' && github.repository == 'mutagen-io/mutagen'" {
 		t.Error("inherited upstream publisher is not restricted to the upstream repository")
+	}
+}
+
+func TestCanonicalCIRunsAgentRootSecurityTests(t *testing.T) {
+	testScript, err := os.ReadFile("test.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := "go test -v -tags mutagenagent,mutagensspl ./cmd/mutagen-agent"
+	if !strings.Contains(string(testScript), command) {
+		t.Fatalf("canonical CI does not run the tagged mutagen-agent security tests with %q", command)
 	}
 }
 

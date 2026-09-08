@@ -5,12 +5,61 @@ import (
 	"errors"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/mutagen-io/mutagen/pkg/synchronization"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/gitworktree"
 )
+
+func TestRootedRemoteScanPreservesGitSelectionUnavailable(t *testing.T) {
+	root := t.TempDir()
+	connection, _ := startRootedServer(t, root)
+	endpoint, err := NewEndpoint(nil, connection, "", "git-selection-error", synchronization.DefaultVersion,
+		&synchronization.Configuration{IgnoreSyntax: ignore.Syntax_SyntaxGitWorktree}, false)
+	if err != nil {
+		if !gitworktree.IsSelectionUnavailable(err) {
+			t.Fatalf("remote initialization lost typed Git failure: %v", err)
+		}
+		return
+	}
+	defer endpoint.Shutdown()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err, _ = endpoint.Scan(ctx, nil, true)
+	if !gitworktree.IsSelectionUnavailable(err) {
+		t.Fatalf("remote scan lost typed Git failure: %v", err)
+	}
+}
+
+func TestRootedRemoteScanPreservesGitFailureAfterInitialization(t *testing.T) {
+	root := t.TempDir()
+	if output, err := exec.Command("git", "init", "--quiet", root).CombinedOutput(); err != nil {
+		t.Fatalf("initialize repository: %v: %s", err, output)
+	}
+	connection, _ := startRootedServer(t, root)
+	endpoint, err := NewEndpoint(nil, connection, "", "git-selection-mid-scan", synchronization.DefaultVersion,
+		&synchronization.Configuration{IgnoreSyntax: ignore.Syntax_SyntaxGitWorktree, WatchMode: synchronization.WatchMode_WatchModeNoWatch}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer endpoint.Shutdown()
+	// Removing only this test-created metadata makes the next real scan fail
+	// at the Git-selection owner after a successful remote initialization.
+	if err := os.Rename(filepath.Join(root, ".git"), filepath.Join(t.TempDir(), "git-metadata")); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err, _ = endpoint.Scan(ctx, nil, true)
+	if !gitworktree.IsSelectionUnavailable(err) {
+		t.Fatalf("remote scan lost typed Git failure: %v", err)
+	}
+}
 
 // startRootedServer serves an endpoint at the specified enforced root on one
 // end of a buffered in-memory socket pair. A loopback TCP pair is used instead
@@ -21,6 +70,7 @@ import (
 // error.
 func startRootedServer(t *testing.T, root string) (net.Conn, chan error) {
 	t.Helper()
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal("unable to create loopback listener:", err)

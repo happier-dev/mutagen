@@ -122,7 +122,7 @@ func NewEndpoint(
 	} else if err = response.ensureValid(); err != nil {
 		return nil, fmt.Errorf("invalid initialize response: %w", err)
 	} else if response.Error != "" {
-		return nil, fmt.Errorf("remote error: %s", response.Error)
+		return nil, decodeEndpointError(response.ErrorCode, response.Error)
 	}
 
 	// Success.
@@ -314,7 +314,7 @@ func (c *endpointClient) Scan(ctx context.Context, ancestor *core.Entry, full bo
 
 	// Check for remote errors.
 	if response.Error != "" {
-		return nil, fmt.Errorf("remote error: %s", response.Error), response.TryAgain
+		return nil, decodeEndpointError(response.ErrorCode, response.Error), response.TryAgain
 	}
 
 	// Apply the remote's deltas to the expected snapshot.

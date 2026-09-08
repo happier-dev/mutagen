@@ -22,6 +22,18 @@ import (
 
 var errSelectionUnavailable = errors.New("git_selection_unavailable")
 
+// IsSelectionUnavailable classifies the closed Git-selection failure without
+// requiring callers to parse wrapped diagnostic prose.
+func IsSelectionUnavailable(err error) bool {
+	return errors.Is(err, errSelectionUnavailable)
+}
+
+// SelectionUnavailableError restores the error identity from a typed remote
+// failure while preserving its diagnostic message.
+func SelectionUnavailableError(message string) error {
+	return fmt.Errorf("%w: %s", errSelectionUnavailable, message)
+}
+
 type Ignorer struct {
 	root          string
 	extraIgnores  []string

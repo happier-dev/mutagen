@@ -246,7 +246,7 @@ func serveEndpointWithRoot(logger *logging.Logger, stream io.ReadWriteCloser, en
 	)
 	if err != nil {
 		err = fmt.Errorf("unable to create underlying endpoint: %w", err)
-		encoder.Encode(&InitializeSynchronizationResponse{Error: err.Error()})
+		encoder.Encode(&InitializeSynchronizationResponse{Error: err.Error(), ErrorCode: endpointErrorCode(err)})
 		flusher.Flush()
 		return err
 	}
@@ -436,8 +436,9 @@ func (s *endpointServer) serveScan(request *ScanRequest) error {
 		snapshot, err, tryAgain := s.endpoint.Scan(ctx, nil, request.Full)
 		if err != nil {
 			response = &ScanResponse{
-				Error:    err.Error(),
-				TryAgain: tryAgain,
+				Error:     err.Error(),
+				ErrorCode: endpointErrorCode(err),
+				TryAgain:  tryAgain,
 			}
 		} else if snapshotBytes, err := marshaling.Marshal(snapshot); err != nil {
 			response = &ScanResponse{

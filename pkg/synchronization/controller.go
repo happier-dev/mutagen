@@ -18,6 +18,7 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/state"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/gitworktree"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/rsync"
 	"github.com/mutagen-io/mutagen/pkg/url"
 )
@@ -30,6 +31,13 @@ const (
 	// rescan after an ephemeral scan failure.
 	rescanWaitDuration = 5 * time.Second
 )
+
+func selectionErrorCode(err error) string {
+	if gitworktree.IsSelectionUnavailable(err) {
+		return "git_selection_unavailable"
+	}
+	return ""
+}
 
 // controller manages and executes a single session.
 type controller struct {
@@ -720,7 +728,8 @@ func (c *controller) run(ctx context.Context, alpha, beta Endpoint) {
 				c.stateLock.Lock()
 				c.state.Status = Status_ConnectingAlpha
 				c.stateLock.Unlock()
-				alpha, _ = connect(
+				var connectErr error
+				alpha, connectErr = connect(
 					ctx,
 					c.logger.Sublogger("alpha"),
 					c.session.Alpha,
@@ -730,6 +739,12 @@ func (c *controller) run(ctx context.Context, alpha, beta Endpoint) {
 					c.mergedAlphaConfiguration,
 					true,
 				)
+				if connectErr != nil {
+					c.stateLock.Lock()
+					c.state.LastError = fmt.Sprintf("unable to connect to alpha: %v", connectErr)
+					c.state.LastErrorCode = selectionErrorCode(connectErr)
+					c.stateLock.Unlock()
+				}
 			}
 			c.stateLock.Lock()
 			c.state.AlphaState.Connected = (alpha != nil)
@@ -748,7 +763,8 @@ func (c *controller) run(ctx context.Context, alpha, beta Endpoint) {
 				c.stateLock.Lock()
 				c.state.Status = Status_ConnectingBeta
 				c.stateLock.Unlock()
-				beta, _ = connect(
+				var connectErr error
+				beta, connectErr = connect(
 					ctx,
 					c.logger.Sublogger("beta"),
 					c.session.Beta,
@@ -758,6 +774,12 @@ func (c *controller) run(ctx context.Context, alpha, beta Endpoint) {
 					c.mergedBetaConfiguration,
 					false,
 				)
+				if connectErr != nil {
+					c.stateLock.Lock()
+					c.state.LastError = fmt.Sprintf("unable to connect to beta: %v", connectErr)
+					c.state.LastErrorCode = selectionErrorCode(connectErr)
+					c.stateLock.Unlock()
+				}
 			}
 			c.stateLock.Lock()
 			c.state.BetaState.Connected = (beta != nil)
@@ -817,10 +839,11 @@ func (c *controller) run(ctx context.Context, alpha, beta Endpoint) {
 		// that caused failure.
 		c.stateLock.Lock()
 		c.state = &State{
-			Session:    c.session,
-			LastError:  err.Error(),
-			AlphaState: &EndpointState{},
-			BetaState:  &EndpointState{},
+			Session:       c.session,
+			LastError:     err.Error(),
+			LastErrorCode: selectionErrorCode(err),
+			AlphaState:    &EndpointState{},
+			BetaState:     &EndpointState{},
 		}
 		c.stateLock.Unlock()
 
@@ -854,6 +877,7 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 	c.stateLock.Lock()
 	if c.state.LastError != "" {
 		c.state.LastError = ""
+		c.state.LastErrorCode = ""
 		c.stateLock.Unlock()
 	} else {
 		c.stateLock.UnlockWithoutNotify()
@@ -1055,6 +1079,7 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 			} else {
 				c.stateLock.Lock()
 				c.state.LastError = αScanErr.Error()
+				c.state.LastErrorCode = selectionErrorCode(αScanErr)
 				c.stateLock.Unlock()
 			}
 		}
@@ -1065,6 +1090,7 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 			} else {
 				c.stateLock.Lock()
 				c.state.LastError = βScanErr.Error()
+				c.state.LastErrorCode = selectionErrorCode(βScanErr)
 				c.stateLock.Unlock()
 			}
 		}
@@ -1134,6 +1160,7 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 		// at the start of this function).
 		c.stateLock.Lock()
 		c.state.LastError = ""
+		c.state.LastErrorCode = ""
 		c.state.AlphaState.Scanned = true
 		c.state.AlphaState.Directories = αDirectoryCount
 		c.state.AlphaState.Files = αSnapshot.Files

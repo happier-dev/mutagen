@@ -18,6 +18,7 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/synchronization"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/gitworktree"
 	externalprotocol "github.com/mutagen-io/mutagen/pkg/synchronization/protocols/external"
 	"github.com/mutagen-io/mutagen/pkg/url"
 )
@@ -96,6 +97,7 @@ type sessionSummary struct {
 	SuccessfulCycles uint64                   `json:"successfulCycles"`
 	ConflictCount    uint64                   `json:"conflictCount"`
 	LastError        string                   `json:"lastError,omitempty"`
+	LastErrorCode    string                   `json:"lastErrorCode,omitempty"`
 }
 
 type sessionListPage struct {
@@ -103,12 +105,29 @@ type sessionListPage struct {
 	NextCursor *string          `json:"nextCursor"`
 }
 
+type conflictRootEntry struct {
+	Kind   string `json:"kind"`
+	Digest string `json:"digest,omitempty"`
+}
+
+type conflictRootChange struct {
+	Path string             `json:"path"`
+	Old  *conflictRootEntry `json:"old"`
+	New  *conflictRootEntry `json:"new"`
+}
+
+type conflictSummary struct {
+	Root         string               `json:"root"`
+	AlphaChanges []conflictRootChange `json:"alphaChanges"`
+	BetaChanges  []conflictRootChange `json:"betaChanges"`
+}
+
 type conflictProjection struct {
-	TotalCount     int                           `json:"totalCount"`
-	ShownCount     int                           `json:"shownCount"`
-	TruncatedCount int                           `json:"truncatedCount"`
-	Conflicts      []synchronizationapi.Conflict `json:"conflicts"`
-	NextCursor     *string                       `json:"nextCursor"`
+	TotalCount     int               `json:"totalCount"`
+	ShownCount     int               `json:"shownCount"`
+	TruncatedCount int               `json:"truncatedCount"`
+	Conflicts      []conflictSummary `json:"conflicts"`
+	NextCursor     *string           `json:"nextCursor"`
 }
 
 type policyPage struct {
@@ -449,10 +468,14 @@ func createSession(ctx context.Context, manager *synchronization.Manager, defini
 			configuration.Ignores = append(configuration.Ignores, "!"+strings.TrimPrefix(pattern, "!"))
 		}
 	default:
-		return "", errors.New("git_selection_unavailable")
+		return "", newBrokerResponseError("git_selection_unavailable", "Git selection is unavailable")
 	}
 	configuration.Ignores = append(configuration.Ignores, ".git/")
-	return manager.Create(ctx, alpha, beta, configuration, &synchronization.Configuration{}, &synchronization.Configuration{}, definition.Name, definition.Labels, true, "")
+	identifier, err := manager.Create(ctx, alpha, beta, configuration, &synchronization.Configuration{}, &synchronization.Configuration{}, definition.Name, definition.Labels, true, "")
+	if gitworktree.IsSelectionUnavailable(err) {
+		return "", newBrokerResponseError("git_selection_unavailable", "Git selection is unavailable")
+	}
+	return identifier, err
 }
 
 func validateContentPolicy(policy contentPolicy) error {
@@ -474,10 +497,66 @@ func validateContentPolicy(policy contentPolicy) error {
 	return nil
 }
 
-func conflictViewFingerprint(conflicts []synchronizationapi.Conflict, excluded uint64) string {
+func compactConflictRootEntry(entry *synchronizationapi.Entry) *conflictRootEntry {
+	if entry == nil {
+		return nil
+	}
+	result := &conflictRootEntry{}
+	switch entry.Kind {
+	case core.EntryKind_Directory:
+		result.Kind = "directory"
+	case core.EntryKind_File:
+		result.Kind = "file"
+		if entry.FileEntry != nil {
+			result.Digest = entry.Digest
+		}
+	case core.EntryKind_SymbolicLink:
+		result.Kind = "symlink"
+	case core.EntryKind_Untracked:
+		result.Kind = "untracked"
+	case core.EntryKind_Problematic:
+		result.Kind = "problematic"
+	default:
+		result.Kind = "unknown"
+	}
+	return result
+}
+
+func compactConflictRootChanges(root string, changes []synchronizationapi.Change) []conflictRootChange {
+	result := make([]conflictRootChange, 0, 1)
+	if len(changes) == 0 {
+		return result
+	}
+	for _, change := range changes {
+		if change.Path == root {
+			return append(result, conflictRootChange{
+				Path: root,
+				Old:  compactConflictRootEntry(change.Old),
+				New:  compactConflictRootEntry(change.New),
+			})
+		}
+	}
+	// Mutagen's diff descends only when the root entries are equal directories.
+	// Descendant changes therefore describe a surviving directory, not the kind
+	// or digest of whichever child happens to be last in map iteration order.
+	return append(result, conflictRootChange{Path: root,
+		Old: &conflictRootEntry{Kind: "directory"},
+		New: &conflictRootEntry{Kind: "directory"},
+	})
+}
+
+func compactConflict(conflict synchronizationapi.Conflict) conflictSummary {
+	return conflictSummary{
+		Root:         conflict.Root,
+		AlphaChanges: compactConflictRootChanges(conflict.Root, conflict.AlphaChanges),
+		BetaChanges:  compactConflictRootChanges(conflict.Root, conflict.BetaChanges),
+	}
+}
+
+func conflictViewFingerprint(conflicts []conflictSummary, excluded uint64) string {
 	payload, _ := json.Marshal(struct {
-		Excluded  uint64                        `json:"excluded"`
-		Conflicts []synchronizationapi.Conflict `json:"conflicts"`
+		Excluded  uint64            `json:"excluded"`
+		Conflicts []conflictSummary `json:"conflicts"`
 	}{excluded, conflicts})
 	digest := sha256.Sum256(payload)
 	return hex.EncodeToString(digest[:8])
@@ -499,7 +578,10 @@ func parseConflictCursor(cursor, fingerprint string, maximum int) (int, error) {
 }
 
 func projectConflictPage(requestID string, conflicts []synchronizationapi.Conflict, excluded uint64, cursor string, limit int) (conflictProjection, error) {
-	sorted := append([]synchronizationapi.Conflict(nil), conflicts...)
+	sorted := make([]conflictSummary, len(conflicts))
+	for index, conflict := range conflicts {
+		sorted[index] = compactConflict(conflict)
+	}
 	sort.Slice(sorted, func(i, j int) bool {
 		if sorted[i].Root != sorted[j].Root {
 			return sorted[i].Root < sorted[j].Root
@@ -516,14 +598,14 @@ func projectConflictPage(requestID string, conflicts []synchronizationapi.Confli
 	total := len(conflicts) + int(excluded)
 	result := conflictProjection{
 		TotalCount: total,
-		Conflicts:  make([]synchronizationapi.Conflict, 0, min(len(sorted)-offset, limit)),
+		Conflicts:  make([]conflictSummary, 0, min(len(sorted)-offset, limit)),
 	}
 	for _, conflict := range sorted[offset:] {
 		if len(result.Conflicts) == limit {
 			break
 		}
 		candidate := result
-		candidate.Conflicts = append(append([]synchronizationapi.Conflict(nil), result.Conflicts...), conflict)
+		candidate.Conflicts = append(append([]conflictSummary(nil), result.Conflicts...), conflict)
 		candidate.ShownCount = len(candidate.Conflicts)
 		candidate.TruncatedCount = total - offset - candidate.ShownCount
 		if offset+candidate.ShownCount < len(sorted) {
@@ -577,6 +659,7 @@ func summarizeSession(state *synchronization.State) sessionSummary {
 		SuccessfulCycles: state.SuccessfulCycles,
 		ConflictCount:    uint64(len(state.Conflicts)) + state.ExcludedConflicts,
 		LastError:        boundedResponseString(state.LastError, 4096),
+		LastErrorCode:    state.LastErrorCode,
 	}
 }
 
