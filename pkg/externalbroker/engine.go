@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -70,6 +72,26 @@ type selectedCommand struct {
 	Cursor            string `json:"cursor,omitempty"`
 }
 
+type diagnoseSelectionCommand struct {
+	T                 string `json:"t"`
+	RequestID         string `json:"requestId"`
+	SessionIdentifier string `json:"sessionIdentifier"`
+	Side              string `json:"side"`
+	Path              string `json:"path"`
+}
+
+func validSelectionDiagnosisPath(value string) bool {
+	if value == "" || path.IsAbs(value) || filepath.IsAbs(value) || strings.ContainsRune(value, '\\') || strings.ContainsRune(value, 0) {
+		return false
+	}
+	for _, component := range strings.Split(value, "/") {
+		if component == "" || component == "." || component == ".." {
+			return false
+		}
+	}
+	return true
+}
+
 type listCommand struct {
 	T         string `json:"t"`
 	RequestID string `json:"requestId"`
@@ -78,11 +100,17 @@ type listCommand struct {
 }
 
 type sessionEndpointSummary struct {
-	Protocol  url.Protocol `json:"protocol"`
-	Host      string       `json:"host"`
-	Path      string       `json:"path"`
-	Connected bool         `json:"connected"`
-	Scanned   bool         `json:"scanned"`
+	Protocol url.Protocol                 `json:"protocol"`
+	Host     string                       `json:"host"`
+	Path     string                       `json:"path"`
+	State    *sessionEndpointStateSummary `json:"state"`
+}
+
+type sessionEndpointStateSummary struct {
+	Connected              bool   `json:"connected"`
+	Scanned                bool   `json:"scanned"`
+	ScanProblemCount       uint64 `json:"scanProblemCount"`
+	TransitionProblemCount uint64 `json:"transitionProblemCount"`
 }
 
 type sessionSummary struct {
@@ -337,6 +365,26 @@ func executeCommand(ctx context.Context, manager *synchronization.Manager, raw j
 		}
 		status, err := getSession(ctx, manager, identifier)
 		return status, false, err
+	case "diagnose_selection":
+		var command diagnoseSelectionCommand
+		if err := decodeCommandStrict(envelope.Command, &command); err != nil ||
+			!validIdentifier(command.SessionIdentifier) ||
+			(command.Side != "alpha" && command.Side != "beta") ||
+			!validSelectionDiagnosisPath(command.Path) {
+			return nil, false, errors.New("invalid selection diagnosis command")
+		}
+		verdict, err := manager.DiagnoseSelection(ctx, command.SessionIdentifier, command.Side, command.Path)
+		if err != nil {
+			reason := "selection_unavailable"
+			if errors.Is(err, synchronization.ErrSelectionEndpointUnavailable) {
+				reason = "endpoint_unavailable"
+			}
+			return map[string]string{"status": "unknown", "reason": reason}, false, nil
+		}
+		if !verdict.Excluded {
+			return map[string]string{"status": "included"}, false, nil
+		}
+		return map[string]string{"status": "excluded", "reason": string(verdict.Reason)}, false, nil
 	case "get", "flush", "pause", "resume", "terminate", "get_policy", "list_conflicts":
 		var command selectedCommand
 		if err := decodeCommandStrict(envelope.Command, &command); err != nil || !validIdentifier(command.SessionIdentifier) {
@@ -470,7 +518,7 @@ func createSession(ctx context.Context, manager *synchronization.Manager, defini
 	default:
 		return "", newBrokerResponseError("git_selection_unavailable", "Git selection is unavailable")
 	}
-	configuration.Ignores = append(configuration.Ignores, ".git/")
+	configuration.Ignores = append(configuration.Ignores, ".git")
 	identifier, err := manager.Create(ctx, alpha, beta, configuration, &synchronization.Configuration{}, &synchronization.Configuration{}, definition.Name, definition.Labels, true, "")
 	if gitworktree.IsSelectionUnavailable(err) {
 		return "", newBrokerResponseError("git_selection_unavailable", "Git selection is unavailable")
@@ -637,8 +685,12 @@ func summarizeSession(state *synchronization.State) sessionSummary {
 	endpoint := func(endpointURL *url.URL, endpointState *synchronization.EndpointState) sessionEndpointSummary {
 		result := sessionEndpointSummary{Protocol: endpointURL.Protocol, Host: endpointURL.Host, Path: endpointURL.Path}
 		if endpointState != nil {
-			result.Connected = endpointState.Connected
-			result.Scanned = endpointState.Scanned
+			result.State = &sessionEndpointStateSummary{
+				Connected:              endpointState.Connected,
+				Scanned:                endpointState.Scanned,
+				ScanProblemCount:       uint64(len(endpointState.ScanProblems)) + endpointState.ExcludedScanProblems,
+				TransitionProblemCount: uint64(len(endpointState.TransitionProblems)) + endpointState.ExcludedTransitionProblems,
+			}
 		}
 		return result
 	}

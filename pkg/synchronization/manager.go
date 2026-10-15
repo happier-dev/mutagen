@@ -12,6 +12,7 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/selection"
 	"github.com/mutagen-io/mutagen/pkg/state"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/gitworktree"
 	"github.com/mutagen-io/mutagen/pkg/url"
 )
 
@@ -42,6 +43,22 @@ type Manager struct {
 	sessionsLock *state.TrackingLock
 	// sessions maps sessions to their respective controllers.
 	sessions map[string]*controller
+}
+
+// DiagnoseSelection asks the active endpoint in one exact session for its
+// current scanner decision. It never reconstructs policy from a session state
+// snapshot or accepts an endpoint root from the caller.
+func (m *Manager) DiagnoseSelection(ctx context.Context, sessionIdentifier, side, path string) (gitworktree.SelectionVerdict, error) {
+	if side != "alpha" && side != "beta" {
+		return gitworktree.SelectionVerdict{}, errors.New("invalid endpoint side")
+	}
+	m.sessionsLock.Lock()
+	controller := m.sessions[sessionIdentifier]
+	m.sessionsLock.UnlockWithoutNotify()
+	if controller == nil {
+		return gitworktree.SelectionVerdict{}, ErrSelectionEndpointUnavailable
+	}
+	return controller.diagnoseSelection(ctx, side, path)
 }
 
 // NewManager creates a new Manager instance.

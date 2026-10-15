@@ -97,8 +97,22 @@ type controller struct {
 	// is buffered, allowing a single request to be queued. All requests passed
 	// via this channel must be buffered and contain room for one error.
 	flushRequests chan chan error
+	// selectionDiagnosisRequests enter the same endpoint lifecycle as scans.
+	selectionDiagnosisRequests chan selectionDiagnosisRequest
 	// done will be closed by the current synchronization loop when it exits.
 	done chan struct{}
+}
+
+type selectionDiagnosisRequest struct {
+	context context.Context
+	side    string
+	path    string
+	result  chan selectionDiagnosisResult
+}
+
+type selectionDiagnosisResult struct {
+	verdict gitworktree.SelectionVerdict
+	err     error
 }
 
 // newSession creates a new session and corresponding controller.
@@ -239,6 +253,7 @@ func newSession(
 		ctx, cancel := context.WithCancel(context.Background())
 		controller.cancel = cancel
 		controller.flushRequests = make(chan chan error, 1)
+		controller.selectionDiagnosisRequests = make(chan selectionDiagnosisRequest, 1)
 		controller.done = make(chan struct{})
 		go controller.run(ctx, alphaEndpoint, betaEndpoint)
 		alphaEndpoint = nil
@@ -307,6 +322,7 @@ func loadSession(logger *logging.Logger, tracker *state.Tracker, identifier stri
 		ctx, cancel := context.WithCancel(context.Background())
 		controller.cancel = cancel
 		controller.flushRequests = make(chan chan error, 1)
+		controller.selectionDiagnosisRequests = make(chan selectionDiagnosisRequest, 1)
 		controller.done = make(chan struct{})
 		go controller.run(ctx, nil, nil)
 	}
@@ -419,6 +435,45 @@ func (c *controller) flush(ctx context.Context, prompter string, skipWait bool) 
 	}
 }
 
+func (c *controller) diagnoseSelection(ctx context.Context, side, path string) (gitworktree.SelectionVerdict, error) {
+	c.lifecycleLock.Lock()
+	if c.disabled || c.cancel == nil || c.selectionDiagnosisRequests == nil {
+		c.lifecycleLock.Unlock()
+		return gitworktree.SelectionVerdict{}, ErrSelectionEndpointUnavailable
+	}
+	c.stateLock.Lock()
+	synchronizing := c.synchronizing
+	c.stateLock.UnlockWithoutNotify()
+	if synchronizing == nil {
+		c.lifecycleLock.Unlock()
+		return gitworktree.SelectionVerdict{}, ErrSelectionEndpointUnavailable
+	}
+	requests := c.selectionDiagnosisRequests
+	done := c.done
+	c.lifecycleLock.Unlock()
+
+	request := selectionDiagnosisRequest{context: ctx, side: side, path: path, result: make(chan selectionDiagnosisResult, 1)}
+	select {
+	case requests <- request:
+	case <-ctx.Done():
+		return gitworktree.SelectionVerdict{}, ctx.Err()
+	case <-synchronizing:
+		return gitworktree.SelectionVerdict{}, ErrSelectionEndpointUnavailable
+	case <-done:
+		return gitworktree.SelectionVerdict{}, ErrSelectionEndpointUnavailable
+	}
+	select {
+	case result := <-request.result:
+		return result.verdict, result.err
+	case <-ctx.Done():
+		return gitworktree.SelectionVerdict{}, ctx.Err()
+	case <-synchronizing:
+		return gitworktree.SelectionVerdict{}, ErrSelectionEndpointUnavailable
+	case <-done:
+		return gitworktree.SelectionVerdict{}, ErrSelectionEndpointUnavailable
+	}
+}
+
 // resume attempts to reconnect and resume the session if it isn't currently
 // connected and synchronizing. If lifecycleLockHeld is true, then halt will
 // assume that the lifecycle lock is held by the caller and will not attempt to
@@ -473,6 +528,7 @@ func (c *controller) resume(ctx context.Context, prompter string, lifecycleLockH
 		// Nil out any lifecycle state.
 		c.cancel = nil
 		c.flushRequests = nil
+		c.selectionDiagnosisRequests = nil
 		c.done = nil
 	}
 
@@ -524,6 +580,7 @@ func (c *controller) resume(ctx context.Context, prompter string, lifecycleLockH
 	ctx, cancel := context.WithCancel(context.Background())
 	c.cancel = cancel
 	c.flushRequests = make(chan chan error, 1)
+	c.selectionDiagnosisRequests = make(chan selectionDiagnosisRequest, 1)
 	c.done = make(chan struct{})
 	go c.run(ctx, alpha, beta)
 
@@ -602,6 +659,7 @@ func (c *controller) halt(_ context.Context, mode controllerHaltMode, prompter s
 		// Nil out any lifecycle state.
 		c.cancel = nil
 		c.flushRequests = nil
+		c.selectionDiagnosisRequests = nil
 		c.done = nil
 	}
 
@@ -1003,6 +1061,7 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 			// request, or for cancellation. In any of these cases, cancel
 			// polling and ensure that both polling operations have completed.
 			var αPollErr, βPollErr error
+			var diagnosis *selectionDiagnosisRequest
 			cancelled := false
 			select {
 			case αPollErr = <-αPollResults:
@@ -1021,6 +1080,11 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 				pollCancel()
 				αPollErr = <-αPollResults
 				βPollErr = <-βPollResults
+			case request := <-c.selectionDiagnosisRequests:
+				diagnosis = &request
+				pollCancel()
+				αPollErr = <-αPollResults
+				βPollErr = <-βPollResults
 			case <-ctx.Done():
 				cancelled = true
 				pollCancel()
@@ -1035,6 +1099,21 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
 				return fmt.Errorf("alpha polling error: %w", αPollErr)
 			} else if βPollErr != nil {
 				return fmt.Errorf("beta polling error: %w", βPollErr)
+			}
+			if diagnosis != nil {
+				var selected Endpoint
+				switch diagnosis.side {
+				case "alpha":
+					selected = alpha
+				case "beta":
+					selected = beta
+				}
+				result := selectionDiagnosisResult{err: ErrSelectionEndpointUnavailable}
+				if diagnoser, ok := selected.(SelectionDiagnosingEndpoint); ok && diagnosis.context.Err() == nil {
+					result.verdict, result.err = diagnoser.DiagnoseSelection(diagnosis.context, diagnosis.path)
+				}
+				diagnosis.result <- result
+				continue
 			}
 		} else {
 			c.logger.Debug("Skipping polling")

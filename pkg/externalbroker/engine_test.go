@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -751,7 +753,11 @@ func TestManagerCommandResponsesUseCompactSessionSummariesAndPagedList(t *testin
 	}
 	defer manager.Shutdown()
 	previous := synchronization.ProtocolHandlers[url.Protocol_External]
-	synchronization.ProtocolHandlers[url.Protocol_External] = externalprotocol.NewProtocolHandler(commandTestDialer{alpha: t.TempDir(), beta: t.TempDir()})
+	alphaRoot, betaRoot := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(alphaRoot, ".git"), []byte("gitdir: /private/common/worktrees/linked\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	synchronization.ProtocolHandlers[url.Protocol_External] = externalprotocol.NewProtocolHandler(commandTestDialer{alpha: alphaRoot, beta: betaRoot})
 	defer func() { synchronization.ProtocolHandlers[url.Protocol_External] = previous }()
 
 	policy := map[string]any{"selection": "all_files", "extraIgnorePatterns": []string{}, "extraIncludePatterns": []string{}}
@@ -801,6 +807,41 @@ func TestManagerCommandResponsesUseCompactSessionSummariesAndPagedList(t *testin
 		if _, ok := result.(sessionSummary); !ok {
 			t.Fatalf("%s did not return a compact session summary: %#v", tag, result)
 		}
+		if tag == "flush" {
+			for _, test := range []struct {
+				path   string
+				status string
+				reason string
+			}{
+				{path: "ordinary.txt", status: "included"},
+				{path: ".git", status: "excluded", reason: "repository_metadata"},
+			} {
+				selection, _, diagnosisErr := executeCommand(context.Background(), manager, commandFrame(t, "diagnose-1", map[string]any{
+					"t": "diagnose_selection", "requestId": "diagnose-1", "sessionIdentifier": created.Identifier,
+					"side": "alpha", "path": test.path,
+				}))
+				if diagnosisErr != nil {
+					t.Fatalf("live diagnosis for %q failed: %v", test.path, diagnosisErr)
+				}
+				got, ok := selection.(map[string]string)
+				if !ok || got["status"] != test.status || got["reason"] != test.reason {
+					t.Fatalf("live diagnosis for %q differs from endpoint policy: %#v", test.path, selection)
+				}
+			}
+			if _, err := os.Lstat(filepath.Join(betaRoot, ".git")); !os.IsNotExist(err) {
+				t.Fatalf("linked-worktree administrative pointer reached the replica: %v", err)
+			}
+		}
+	}
+	pausedSelection, _, diagnosisErr := executeCommand(context.Background(), manager, commandFrame(t, "diagnose-paused", map[string]any{
+		"t": "diagnose_selection", "requestId": "diagnose-paused", "sessionIdentifier": created.Identifier,
+		"side": "alpha", "path": "ordinary.txt",
+	}))
+	if diagnosisErr != nil {
+		t.Fatal("paused selection diagnosis failed:", diagnosisErr)
+	}
+	if got, ok := pausedSelection.(map[string]string); !ok || got["status"] != "unknown" || got["reason"] != "endpoint_unavailable" {
+		t.Fatalf("paused endpoint selection was not explicitly unavailable: %#v", pausedSelection)
 	}
 	list := map[string]any{"t": "list", "requestId": "list-1", "limit": 100}
 	result, _, err = executeCommand(context.Background(), manager, commandFrame(t, "list-1", list))
@@ -833,6 +874,34 @@ func TestSummarizeSessionCarriesTypedGitSelectionFailure(t *testing.T) {
 	summary := summarizeSession(state)
 	if summary.LastErrorCode != "git_selection_unavailable" {
 		t.Fatalf("typed error code was not preserved: %#v", summary)
+	}
+}
+
+func TestSummarizeSessionCarriesEndpointProblemsAndAbsence(t *testing.T) {
+	state := &synchronization.State{
+		Session: &synchronization.Session{
+			Identifier:    "session-1",
+			Name:          "session-1",
+			Alpha:         &url.URL{Protocol: url.Protocol_External, Host: "alpha"},
+			Beta:          &url.URL{Protocol: url.Protocol_External, Host: "beta"},
+			Configuration: &synchronization.Configuration{},
+		},
+		AlphaState: &synchronization.EndpointState{
+			Connected:                  true,
+			Scanned:                    true,
+			ScanProblems:               []*core.Problem{{Path: "retained-scan"}},
+			ExcludedScanProblems:       2,
+			TransitionProblems:         []*core.Problem{{Path: "retained-transition"}},
+			ExcludedTransitionProblems: 4,
+		},
+	}
+
+	summary := summarizeSession(state)
+	if summary.Alpha.State == nil || summary.Alpha.State.ScanProblemCount != 3 || summary.Alpha.State.TransitionProblemCount != 5 {
+		t.Fatalf("endpoint problem totals were not preserved: %#v", summary.Alpha)
+	}
+	if summary.Beta.State != nil {
+		t.Fatalf("absent endpoint state was synthesized: %#v", summary.Beta)
 	}
 }
 

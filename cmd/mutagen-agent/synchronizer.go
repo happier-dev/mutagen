@@ -53,13 +53,14 @@ func synchronizerMain(_ *cobra.Command, _ []string) error {
 	if err := validateSynchronizerRootMode(); err != nil {
 		return err
 	}
-	var root string
+	var root *remote.ValidatedEndpointRoot
 	if synchronizerConfiguration.external {
 		var err error
 		root, err = remote.ValidateEndpointRoot(synchronizerConfiguration.root)
 		if err != nil {
 			return fmt.Errorf("invalid --root: %w", err)
 		}
+		defer root.Close()
 	}
 	// Create a channel to track termination signals. We do this before creating
 	// and starting other infrastructure so that we can ensure things terminate
@@ -101,7 +102,7 @@ func synchronizerMain(_ *cobra.Command, _ []string) error {
 	synchronizationTermination := make(chan error, 1)
 	go func() {
 		if synchronizerConfiguration.external {
-			synchronizationTermination <- remote.ServeEndpointAtRoot(logger, stream, root)
+			synchronizationTermination <- remote.ServeEndpointAtValidatedRoot(logger, stream, root)
 		} else {
 			synchronizationTermination <- remote.ServeEndpoint(logger, stream)
 		}

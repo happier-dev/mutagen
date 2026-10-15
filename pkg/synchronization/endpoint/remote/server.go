@@ -19,6 +19,7 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/synchronization/compression"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/endpoint/local"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/gitworktree"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/rsync"
 )
 
@@ -48,103 +49,118 @@ func ServeEndpoint(logger *logging.Logger, stream io.ReadWriteCloser) error {
 // endpoint agent to enforce target-owned path authorization independently of
 // the remote controller's initialization request.
 func ServeEndpointAtRoot(logger *logging.Logger, stream io.ReadWriteCloser, root string) error {
-	validatedRoot, err := validateEndpointRootIdentity(root)
+	validatedRoot, err := ValidateEndpointRoot(root)
 	if err != nil {
 		stream.Close()
 		return err
 	}
-	return serveEndpointAtValidatedRoot(logger, stream, validatedRoot)
+	return ServeEndpointAtValidatedRoot(logger, stream, validatedRoot)
 }
 
-// validatedEndpointRoot binds a rooted endpoint to the filesystem object that
+// ValidatedEndpointRoot binds a rooted endpoint to the filesystem object that
 // was authorized before the protocol handshake. The object is revalidated at
 // the final endpoint-creation boundary so that a pathname replacement during
 // the handshake cannot redirect synchronization to a different directory.
-type validatedEndpointRoot struct {
+// Its fields remain private so callers can only pass the retained authority
+// back to this package for serving.
+type ValidatedEndpointRoot struct {
 	path string
 	info os.FileInfo
 	file *os.File
 }
 
-// ValidateEndpointRoot resolves and validates the target-owned root used by a
-// rooted agent. It rejects missing, inaccessible, non-directory, and symlink
-// roots before any protocol handshake and returns the canonical real path.
-func ValidateEndpointRoot(root string) (string, error) {
-	validated, err := validateEndpointRootIdentity(root)
-	if err != nil {
-		return "", err
-	}
-	defer validated.close()
-	return validated.path, nil
+// Path returns the canonical path bound to this retained authority. It is
+// informational input for the matching endpoint client; serving still requires
+// the retained object itself.
+func (r *ValidatedEndpointRoot) Path() string {
+	return r.path
 }
 
-func validateEndpointRootIdentity(root string) (validatedEndpointRoot, error) {
+// ValidateEndpointRoot resolves and validates the target-owned root used by a
+// rooted agent. It rejects missing, inaccessible, non-directory, and symlink
+// roots before any protocol handshake and retains the authorized filesystem
+// object until serving begins.
+func ValidateEndpointRoot(root string) (*ValidatedEndpointRoot, error) {
+	return validateEndpointRootIdentity(root)
+}
+
+func validateEndpointRootIdentity(root string) (*ValidatedEndpointRoot, error) {
 	if root == "" {
-		return validatedEndpointRoot{}, errors.New("empty enforced synchronization root")
+		return nil, errors.New("empty enforced synchronization root")
 	}
 	normalizedRoot, err := filesystem.Normalize(root)
 	if err != nil {
-		return validatedEndpointRoot{}, fmt.Errorf("unable to normalize enforced synchronization root: %w", err)
+		return nil, fmt.Errorf("unable to normalize enforced synchronization root: %w", err)
 	}
 	metadata, err := os.Lstat(normalizedRoot)
 	if err != nil {
-		return validatedEndpointRoot{}, fmt.Errorf("unable to inspect enforced synchronization root: %w", err)
+		return nil, fmt.Errorf("unable to inspect enforced synchronization root: %w", err)
 	}
 	if metadata.Mode()&os.ModeSymlink != 0 {
-		return validatedEndpointRoot{}, errors.New("enforced synchronization root must not be a symbolic link")
+		return nil, errors.New("enforced synchronization root must not be a symbolic link")
 	}
 	if !metadata.IsDir() {
-		return validatedEndpointRoot{}, errors.New("enforced synchronization root must be a directory")
+		return nil, errors.New("enforced synchronization root must be a directory")
 	}
 	realRoot, err := filepath.EvalSymlinks(normalizedRoot)
 	if err != nil {
-		return validatedEndpointRoot{}, fmt.Errorf("unable to resolve enforced synchronization root: %w", err)
+		return nil, fmt.Errorf("unable to resolve enforced synchronization root: %w", err)
 	}
 	realRoot, err = filesystem.Normalize(realRoot)
 	if err != nil {
-		return validatedEndpointRoot{}, fmt.Errorf("unable to normalize resolved synchronization root: %w", err)
+		return nil, fmt.Errorf("unable to normalize resolved synchronization root: %w", err)
 	}
 	rootFile, err := os.Open(realRoot)
 	if err != nil {
-		return validatedEndpointRoot{}, fmt.Errorf("unable to open resolved synchronization root: %w", err)
+		return nil, fmt.Errorf("unable to open resolved synchronization root: %w", err)
 	}
 	metadata, err = rootFile.Stat()
 	if err != nil {
 		rootFile.Close()
-		return validatedEndpointRoot{}, fmt.Errorf("unable to inspect resolved synchronization root: %w", err)
+		return nil, fmt.Errorf("unable to inspect resolved synchronization root: %w", err)
 	}
-	return validatedEndpointRoot{path: realRoot, info: metadata, file: rootFile}, nil
+	return &ValidatedEndpointRoot{path: realRoot, info: metadata, file: rootFile}, nil
 }
 
-func (r *validatedEndpointRoot) close() {
+// Close releases a validated root that will not be served. Serving consumes
+// and closes the retained root automatically.
+func (r *ValidatedEndpointRoot) Close() error {
 	if r.file != nil {
-		r.file.Close()
+		err := r.file.Close()
 		r.file = nil
+		return err
 	}
+	return nil
 }
 
-func revalidateEndpointRootIdentity(root validatedEndpointRoot) (string, error) {
+func revalidateEndpointRootIdentity(root *ValidatedEndpointRoot) (string, error) {
 	current, err := validateEndpointRootIdentity(root.path)
 	if err != nil {
 		return "", err
 	}
-	defer current.close()
+	defer current.Close()
 	if current.path != root.path || !os.SameFile(root.info, current.info) {
 		return "", errors.New("enforced synchronization root changed during initialization")
 	}
 	return current.path, nil
 }
 
-func serveEndpointAtValidatedRoot(logger *logging.Logger, stream io.ReadWriteCloser, root validatedEndpointRoot) error {
-	defer root.close()
-	return serveEndpointWithRoot(logger, stream, root.path, &root)
+// ServeEndpointAtValidatedRoot serves using the exact filesystem object retained
+// by ValidateEndpointRoot before the command and version handshakes.
+func ServeEndpointAtValidatedRoot(logger *logging.Logger, stream io.ReadWriteCloser, root *ValidatedEndpointRoot) error {
+	if root == nil {
+		stream.Close()
+		return errors.New("missing validated synchronization root")
+	}
+	defer root.Close()
+	return serveEndpointWithRoot(logger, stream, root.path, root)
 }
 
 func serveEndpoint(logger *logging.Logger, stream io.ReadWriteCloser, enforcedRoot string) error {
 	return serveEndpointWithRoot(logger, stream, enforcedRoot, nil)
 }
 
-func serveEndpointWithRoot(logger *logging.Logger, stream io.ReadWriteCloser, enforcedRoot string, validatedRoot *validatedEndpointRoot) error {
+func serveEndpointWithRoot(logger *logging.Logger, stream io.ReadWriteCloser, enforcedRoot string, validatedRoot *ValidatedEndpointRoot) error {
 	// Perform the compression handshake.
 	compressionAlgorithm, err := compression.ServerHandshake(stream)
 	if err != nil {
@@ -224,7 +240,7 @@ func serveEndpointWithRoot(logger *logging.Logger, stream io.ReadWriteCloser, en
 		return err
 	}
 	if validatedRoot != nil {
-		revalidatedRoot, err := revalidateEndpointRootIdentity(*validatedRoot)
+		revalidatedRoot, err := revalidateEndpointRootIdentity(validatedRoot)
 		if err != nil {
 			err = fmt.Errorf("unable to revalidate enforced synchronization root: %w", err)
 			encoder.Encode(&InitializeSynchronizationResponse{Error: err.Error()})
@@ -318,6 +334,10 @@ func (s *endpointServer) serve() error {
 			if err := s.serveTransition(request.Transition); err != nil {
 				return fmt.Errorf("unable to serve transition request: %w", err)
 			}
+		} else if request.DiagnoseSelection != nil {
+			if err := s.serveDiagnoseSelection(request.DiagnoseSelection); err != nil {
+				return fmt.Errorf("unable to serve selection diagnosis: %w", err)
+			}
 		} else {
 			// TODO: Should we panic here? The request validation already
 			// ensures that one and only one message component is set, so we
@@ -325,6 +345,26 @@ func (s *endpointServer) serve() error {
 			return errors.New("invalid request")
 		}
 	}
+}
+
+func (s *endpointServer) serveDiagnoseSelection(request *DiagnoseSelectionRequest) error {
+	response := &DiagnoseSelectionResponse{}
+	if diagnoser, ok := s.endpoint.(synchronization.SelectionDiagnosingEndpoint); ok {
+		verdict, err := diagnoser.DiagnoseSelection(context.Background(), request.Path)
+		if err != nil {
+			response.Error = err.Error()
+			if gitworktree.IsSelectionUnavailable(err) {
+				response.ErrorCode = "git_selection_unavailable"
+			}
+		} else {
+			response.Excluded = verdict.Excluded
+			response.Reason = string(verdict.Reason)
+		}
+	} else {
+		response.Error = "endpoint selection diagnosis unavailable"
+		response.ErrorCode = "git_selection_unavailable"
+	}
+	return s.encodeAndFlush(response)
 }
 
 // servePoll serves a poll request.

@@ -2,10 +2,24 @@ package synchronization
 
 import (
 	"context"
+	"errors"
 
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/gitworktree"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/rsync"
 )
+
+// ErrSelectionEndpointUnavailable means a live endpoint cannot currently
+// answer a read diagnostic. It is distinct from an endpoint whose policy
+// generation exists but cannot be evaluated safely.
+var ErrSelectionEndpointUnavailable = errors.New("selection endpoint unavailable")
+
+// SelectionDiagnosingEndpoint is the optional read diagnostic supported by the
+// live Happier endpoint implementations. It is invoked only from the owning
+// controller loop, never concurrently with Poll, Scan, or Transition.
+type SelectionDiagnosingEndpoint interface {
+	DiagnoseSelection(context.Context, string) (gitworktree.SelectionVerdict, error)
+}
 
 // Endpoint defines the interface to which synchronization endpoints must
 // adhere for a single session. It provides all primitives necessary to support

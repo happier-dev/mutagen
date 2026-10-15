@@ -15,6 +15,7 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/synchronization"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/compression"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
+	"github.com/mutagen-io/mutagen/pkg/synchronization/gitworktree"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/rsync"
 )
 
@@ -34,6 +35,33 @@ type endpointClient struct {
 	// lastSnapshotBytes is the serialized form of the last snapshot received
 	// from the remote endpoint.
 	lastSnapshotBytes []byte
+}
+
+func (c *endpointClient) DiagnoseSelection(ctx context.Context, path string) (gitworktree.SelectionVerdict, error) {
+	if err := ctx.Err(); err != nil {
+		return gitworktree.SelectionVerdict{}, err
+	}
+	if err := c.encodeAndFlush(&EndpointRequest{DiagnoseSelection: &DiagnoseSelectionRequest{Path: path}}); err != nil {
+		return gitworktree.SelectionVerdict{}, fmt.Errorf("unable to send selection diagnosis: %w", err)
+	}
+	response := &DiagnoseSelectionResponse{}
+	if err := c.decoder.Decode(response); err != nil {
+		return gitworktree.SelectionVerdict{}, fmt.Errorf("unable to receive selection diagnosis: %w", err)
+	}
+	if response.Error != "" {
+		return gitworktree.SelectionVerdict{}, decodeEndpointError(response.ErrorCode, response.Error)
+	}
+	if response.ErrorCode != "" || (response.Excluded && response.Reason == "") || (!response.Excluded && response.Reason != "") {
+		return gitworktree.SelectionVerdict{}, errors.New("invalid selection diagnosis response")
+	}
+	reason := gitworktree.SelectionExclusionReason(response.Reason)
+	switch reason {
+	case "", gitworktree.SelectionExcludedRepositoryMetadata, gitworktree.SelectionExcludedSubmodule,
+		gitworktree.SelectionExcludedConfiguredRule, gitworktree.SelectionExcludedGitIgnore:
+	default:
+		return gitworktree.SelectionVerdict{}, errors.New("invalid selection diagnosis reason")
+	}
+	return gitworktree.SelectionVerdict{Excluded: response.Excluded, Reason: reason}, nil
 }
 
 // NewEndpoint creates a new remote synchronization.Endpoint operating over the

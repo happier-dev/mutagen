@@ -448,7 +448,7 @@ func (c *BrokerClient) readLoop() {
 		c.pendingLock.Lock()
 		responses := c.pending[key]
 		_, cancelled := c.cancelled[key]
-		if cancelled {
+		if cancelled && tag.T != "data_ready" {
 			delete(c.cancelled, key)
 		}
 		c.pendingLock.Unlock()

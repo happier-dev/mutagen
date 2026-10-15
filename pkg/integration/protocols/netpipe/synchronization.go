@@ -76,7 +76,7 @@ func (h *synchronizationProtocolHandler) Connect(
 	// we can block on it in our endpoint wrapper.
 	remoteEndpointDone := make(chan struct{})
 	go func() {
-		remote.ServeEndpointAtRoot(logger.Sublogger("remote"), serverConnection, authorizedRoot)
+		remote.ServeEndpointAtValidatedRoot(logger.Sublogger("remote"), serverConnection, authorizedRoot)
 		close(remoteEndpointDone)
 	}()
 
@@ -86,7 +86,7 @@ func (h *synchronizationProtocolHandler) Connect(
 	endpoint, err := remote.NewEndpoint(
 		logger,
 		clientConnection,
-		authorizedRoot,
+		authorizedRoot.Path(),
 		session,
 		version,
 		configuration,

@@ -116,7 +116,7 @@ func TestRevalidateEndpointRootPreventsOrRejectsReplacedDirectory(t *testing.T) 
 	if err != nil {
 		t.Fatal("unable to validate initial root:", err)
 	}
-	t.Cleanup(validated.close)
+	t.Cleanup(func() { validated.Close() })
 	if err := os.Rename(root, filepath.Join(parent, "original")); err != nil {
 		// Windows directory handles deny renaming by default. Retaining the
 		// validated handle therefore prevents replacement before the final

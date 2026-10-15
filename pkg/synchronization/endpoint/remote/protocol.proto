@@ -139,6 +139,21 @@ message TransitionResponse {
     string error = 4;
 }
 
+// DiagnoseSelectionRequest asks the initialized endpoint's current scanner
+// policy to classify one engine-relative path. It carries no root or rules.
+message DiagnoseSelectionRequest {
+    string path = 1;
+}
+
+// DiagnoseSelectionResponse reports only the bounded policy verdict. A
+// changed/unavailable policy is an error, never an included decision.
+message DiagnoseSelectionResponse {
+    bool excluded = 1;
+    string reason = 2;
+    string error = 3;
+    string errorCode = 4;
+}
+
 // EndpointRequest is a sum type that can transmit any type of endpoint request.
 // Only the sent request will be non-nil. We intentionally avoid using Protocol
 // Buffers' oneof feature because it generates really ugly code and an unwieldy
@@ -154,4 +169,5 @@ message EndpointRequest {
     SupplyRequest supply = 4;
     // Transition represents a transition request.
     TransitionRequest transition = 5;
+    DiagnoseSelectionRequest diagnoseSelection = 6;
 }

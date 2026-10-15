@@ -357,6 +357,9 @@ func (r *EndpointRequest) ensureValid() error {
 	if r.Transition != nil {
 		set++
 	}
+	if r.DiagnoseSelection != nil {
+		set++
+	}
 	if set != 1 {
 		return errors.New("invalid number of fields set")
 	}

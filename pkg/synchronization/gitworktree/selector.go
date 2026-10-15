@@ -134,41 +134,115 @@ func (i *Ignorer) SelectionError() error {
 	return nil
 }
 
-func (i *Ignorer) Ignore(path string, directory bool) (ignore.IgnoreStatus, bool) {
+// SelectionExclusionReason identifies which endpoint-local policy layer
+// excluded a path. It is empty for included paths. The scanner never needs
+// this distinction, but the per-path diagnostic reports it so callers can
+// explain why a file is not synchronized without guessing.
+type SelectionExclusionReason string
+
+const (
+	// SelectionExcludedRepositoryMetadata marks endpoint administration data
+	// that synchronization never selects.
+	SelectionExcludedRepositoryMetadata SelectionExclusionReason = "repository_metadata"
+	// SelectionExcludedSubmodule marks submodule worktree contents, which Git
+	// does not select through the parent worktree.
+	SelectionExcludedSubmodule SelectionExclusionReason = "submodule"
+	// SelectionExcludedConfiguredRule marks an exclusion decided by the
+	// relationship's explicit overlay policy, which overrides tracked state.
+	SelectionExcludedConfiguredRule SelectionExclusionReason = "configured_rule"
+	// SelectionExcludedGitIgnore marks an exclusion decided by Git's own
+	// ignore policy for an untracked path.
+	SelectionExcludedGitIgnore SelectionExclusionReason = "git_ignore"
+)
+
+// SelectionVerdict is the bounded per-path selection fact produced by
+// Diagnose. Excluded paths carry the deciding policy layer; included paths
+// carry an empty reason. Staleness is not part of the verdict: callers pair
+// evaluation with SelectionError so a superseded policy generation surfaces
+// as unknown rather than as a clean fact.
+type SelectionVerdict struct {
+	Excluded bool
+	Reason   SelectionExclusionReason
+}
+
+// evaluate is the single shared policy decision behind both the scanner's
+// Ignore and the diagnostic Diagnose, so the two cannot disagree. The
+// returned reason is only meaningful for Ignored results.
+func (i *Ignorer) evaluate(path string, directory bool) (ignore.IgnoreStatus, bool, SelectionExclusionReason) {
 	path = filepath.ToSlash(path)
 	if path == ".git" || strings.HasPrefix(path, ".git/") || strings.Contains(path, "/.git/") || strings.HasSuffix(path, "/.git") {
-		return ignore.IgnoreStatusIgnored, false
+		return ignore.IgnoreStatusIgnored, false, SelectionExcludedRepositoryMetadata
 	}
 
 	overlayStatus, overlayTraversal := i.overlay.Ignore(path, directory)
 	if overlayStatus != ignore.IgnoreStatusNominal {
-		return overlayStatus, overlayTraversal
+		if overlayStatus == ignore.IgnoreStatusIgnored {
+			return overlayStatus, overlayTraversal, SelectionExcludedConfiguredRule
+		}
+		return overlayStatus, overlayTraversal, ""
 	}
 	if i.withinSubmodule(path) {
-		return ignore.IgnoreStatusIgnored, false
+		return ignore.IgnoreStatusIgnored, false, SelectionExcludedSubmodule
 	}
 	if _, ok := i.tracked[path]; ok {
-		return ignore.IgnoreStatusUnignored, false
+		return ignore.IgnoreStatusUnignored, false, ""
 	}
 
 	ignoredByGit, err := i.oracle.ignored(path)
 	if err != nil {
 		// Ignore cannot return an error. Exclusion is the only safe result until
 		// the next Refresh reports the typed selection failure.
-		return ignore.IgnoreStatusIgnored, false
+		return ignore.IgnoreStatusIgnored, false, SelectionExcludedGitIgnore
 	}
 	if ignoredByGit {
 		if directory {
 			if _, containsTrackedPath := i.trackedPrefix[path]; containsTrackedPath {
-				return ignore.IgnoreStatusIgnored, true
+				return ignore.IgnoreStatusIgnored, true, SelectionExcludedGitIgnore
 			}
 			if i.includeCouldMatchDescendant(path) {
-				return ignore.IgnoreStatusIgnored, true
+				return ignore.IgnoreStatusIgnored, true, SelectionExcludedGitIgnore
 			}
 		}
-		return ignore.IgnoreStatusIgnored, overlayTraversal
+		return ignore.IgnoreStatusIgnored, overlayTraversal, SelectionExcludedGitIgnore
 	}
-	return ignore.IgnoreStatusNominal, overlayTraversal
+	return ignore.IgnoreStatusNominal, overlayTraversal, ""
+}
+
+func (i *Ignorer) Ignore(path string, directory bool) (ignore.IgnoreStatus, bool) {
+	status, traversal, _ := i.evaluate(path, directory)
+	return status, traversal
+}
+
+// Diagnose evaluates one endpoint-relative path through the same shared
+// evaluation as the scanner, accounting for ancestor traversal exclusion
+// exactly as traversal does: an ignored ancestor without traversal
+// continuation decides the verdict, while a traversable ignored ancestor
+// still lets a deeper explicit unignore win. Entry kind is observed at the
+// endpoint and supplied as directory. The result is only current if a
+// subsequent SelectionError reports no failure; callers must map that
+// failure to unknown rather than to a clean fact.
+func (i *Ignorer) Diagnose(path string, directory bool) (SelectionVerdict, error) {
+	path = filepath.ToSlash(path)
+	if !validRelativePath(path) {
+		return SelectionVerdict{}, errors.New("invalid selection diagnosis path")
+	}
+	verdict := SelectionVerdict{}
+	components := strings.Split(path, "/")
+	for index := range components {
+		candidate := strings.Join(components[:index+1], "/")
+		last := index == len(components)-1
+		status, traversal, reason := i.evaluate(candidate, !last || directory)
+		switch status {
+		case ignore.IgnoreStatusIgnored:
+			verdict = SelectionVerdict{Excluded: true, Reason: reason}
+			if last || !traversal {
+				return verdict, nil
+			}
+		case ignore.IgnoreStatusUnignored:
+			verdict = SelectionVerdict{}
+		}
+	}
+	return verdict, nil
 }
 
 func (i *Ignorer) includeCouldMatchDescendant(directory string) bool {

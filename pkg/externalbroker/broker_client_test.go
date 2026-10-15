@@ -272,6 +272,13 @@ func TestBrokerClientDrainsLateResponseAfterCancelledPendingRequest(t *testing.T
 			return
 		}
 		if err := writeTestFrame(brokerControl, map[string]any{
+			"t": "data_ready", "requestId": first.RequestID, "streamId": "late-stream",
+			"dataEndpoint": "/tmp/late-stream", "attachNonce": "late-nonce", "expiresAtMs": time.Now().Add(time.Second).UnixMilli(),
+		}); err != nil {
+			brokerFailure <- err
+			return
+		}
+		if err := writeTestFrame(brokerControl, map[string]any{
 			"t": "error", "requestId": first.RequestID, "code": "cancelled", "message": "late terminal response",
 		}); err != nil {
 			brokerFailure <- err

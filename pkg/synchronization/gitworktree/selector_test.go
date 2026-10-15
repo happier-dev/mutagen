@@ -739,3 +739,150 @@ func TestCompilePatternsFailsClosedOutsideGitWorktree(t *testing.T) {
 		t.Fatalf("non-Git root did not fail closed with git_selection_unavailable: %v", err)
 	}
 }
+
+func diagnosePath(t *testing.T, ignorer *Ignorer, path string, directory bool) SelectionVerdict {
+	t.Helper()
+	verdict, err := ignorer.Diagnose(path, directory)
+	if err != nil {
+		t.Fatalf("unable to diagnose selection for %q: %v", path, err)
+	}
+	return verdict
+}
+
+func assertDiagnoseAgreesWithTraversal(t *testing.T, ignorer *Ignorer, path string, directory bool) {
+	t.Helper()
+	verdict := diagnosePath(t, ignorer, path, directory)
+	if selected := selectorSelectsPath(ignorer, path); selected == verdict.Excluded {
+		t.Fatalf("diagnosis disagrees with traversal selection for %q: excluded=%t, selected=%t", path, verdict.Excluded, selected)
+	}
+}
+
+func TestDiagnoseAgreesWithTraversalSelection(t *testing.T) {
+	root := t.TempDir()
+	runGit(t, root, "init", "--quiet")
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("generated/\n*.log\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, root, "update-index", "--add", "--cacheinfo", "160000,1111111111111111111111111111111111111111,dependency")
+	writeFixtureFile(t, root, "dependency/working-tree-file.txt")
+	writeFixtureFile(t, root, "generated/keep.txt")
+	writeFixtureFile(t, root, "generated/deep/keep.txt")
+	writeFixtureFile(t, root, "generated/other.txt")
+	writeFixtureFile(t, root, "tracked.txt")
+	writeFixtureFile(t, root, "tracked.log")
+	writeFixtureFile(t, root, "app.log")
+	writeFixtureFile(t, root, "ordinary.txt")
+	runGit(t, root, "add", "tracked.txt")
+	runGit(t, root, "add", "-f", "tracked.log")
+
+	ignorer, err := NewIgnorer(root, []string{"/tracked.txt"}, []string{"/generated/keep.txt", "/generated/**/keep.txt"})
+	if err != nil {
+		t.Fatal("unable to construct Git selector:", err)
+	}
+	t.Cleanup(func() { ignorer.Close() })
+
+	// Every diagnosed path must agree with the scanner's own traversal
+	// selection. Reasons below pin the deciding policy layer.
+	for _, path := range []string{
+		"tracked.txt",
+		"tracked.log",
+		"generated/keep.txt",
+		"generated/deep/keep.txt",
+		"generated/other.txt",
+		"app.log",
+		"ordinary.txt",
+		"dependency",
+		"dependency/working-tree-file.txt",
+		".git/config",
+	} {
+		assertDiagnoseAgreesWithTraversal(t, ignorer, path, false)
+	}
+	assertDiagnoseAgreesWithTraversal(t, ignorer, "dependency", true)
+
+	// A tracked file overrides Git's own ignore expectation.
+	if verdict := diagnosePath(t, ignorer, "tracked.log", false); verdict.Excluded {
+		t.Fatal("tracked file did not override Git ignore selection")
+	}
+	// An explicit configured ignore overrides even tracked state.
+	if verdict := diagnosePath(t, ignorer, "tracked.txt", false); !verdict.Excluded || verdict.Reason != SelectionExcludedConfiguredRule {
+		t.Fatalf("explicit ignore did not override tracked selection: %+v", verdict)
+	}
+	// An explicit include retains traversal below a Git-ignored directory.
+	if verdict := diagnosePath(t, ignorer, "generated/keep.txt", false); verdict.Excluded {
+		t.Fatalf("explicit include did not retain selection below an ignored directory: %+v", verdict)
+	}
+	if verdict := diagnosePath(t, ignorer, "generated/deep/keep.txt", false); verdict.Excluded {
+		t.Fatalf("wildcard explicit include did not retain selection below an ignored directory: %+v", verdict)
+	}
+	if verdict := diagnosePath(t, ignorer, "generated/other.txt", false); !verdict.Excluded || verdict.Reason != SelectionExcludedGitIgnore {
+		t.Fatalf("Git-ignored file below an ignored directory has the wrong decision: %+v", verdict)
+	}
+	if verdict := diagnosePath(t, ignorer, "app.log", false); !verdict.Excluded || verdict.Reason != SelectionExcludedGitIgnore {
+		t.Fatalf("Git-ignored file has the wrong decision: %+v", verdict)
+	}
+	if verdict := diagnosePath(t, ignorer, "ordinary.txt", false); verdict.Excluded {
+		t.Fatalf("ordinary file was unexpectedly excluded: %+v", verdict)
+	}
+	if verdict := diagnosePath(t, ignorer, "dependency", true); verdict.Excluded {
+		t.Fatalf("tracked gitlink itself was unexpectedly excluded: %+v", verdict)
+	}
+	if verdict := diagnosePath(t, ignorer, "dependency/working-tree-file.txt", false); !verdict.Excluded || verdict.Reason != SelectionExcludedSubmodule {
+		t.Fatalf("submodule worktree content has the wrong decision: %+v", verdict)
+	}
+	if verdict := diagnosePath(t, ignorer, ".git/config", false); !verdict.Excluded || verdict.Reason != SelectionExcludedRepositoryMetadata {
+		t.Fatalf("repository metadata has the wrong decision: %+v", verdict)
+	}
+}
+
+func TestDiagnoseRejectsUnsafePaths(t *testing.T) {
+	root := t.TempDir()
+	runGit(t, root, "init", "--quiet")
+	ignorer, err := NewIgnorer(root, nil, nil)
+	if err != nil {
+		t.Fatal("unable to construct Git selector:", err)
+	}
+	t.Cleanup(func() { ignorer.Close() })
+	for _, path := range []string{"", ".", "..", "../escape", "/absolute", "nul\x00byte"} {
+		if _, err := ignorer.Diagnose(path, false); err == nil {
+			t.Fatalf("diagnosis accepted unsafe path %q", path)
+		}
+	}
+}
+
+func TestDiagnoseRequiresCurrentPolicyGeneration(t *testing.T) {
+	root := t.TempDir()
+	runGit(t, root, "init", "--quiet")
+	ignorePath := filepath.Join(root, ".gitignore")
+	if err := os.WriteFile(ignorePath, []byte("*.log\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeFixtureFile(t, root, "value.cache")
+
+	ignorer, err := NewIgnorer(root, nil, nil)
+	if err != nil {
+		t.Fatal("unable to construct Git selector:", err)
+	}
+	t.Cleanup(func() { ignorer.Close() })
+	if verdict := diagnosePath(t, ignorer, "value.cache", false); verdict.Excluded {
+		t.Fatal("diagnosis excluded a path before its policy rule was added")
+	}
+
+	// A policy change during evaluation cannot turn into a clean included
+	// fact: the incumbent Refresh/SelectionError lifecycle reports the
+	// superseded generation and the caller must surface unknown.
+	if err := os.WriteFile(ignorePath, []byte("*.log\nvalue.cache\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ignorer.SelectionError(); err == nil || err.Error() != "git_selection_unavailable" {
+		t.Fatalf("policy changed during evaluation did not fail closed: %v", err)
+	}
+	if err := ignorer.Refresh(); err != nil {
+		t.Fatal("unable to refresh changed Git policy:", err)
+	}
+	if err := ignorer.SelectionError(); err != nil {
+		t.Fatal("refreshed Git policy still reported a selection failure:", err)
+	}
+	if verdict := diagnosePath(t, ignorer, "value.cache", false); !verdict.Excluded || verdict.Reason != SelectionExcludedGitIgnore {
+		t.Fatalf("refreshed policy decision is wrong: %+v", verdict)
+	}
+}
