@@ -337,7 +337,12 @@ func loadIndex(root string) (map[string]struct{}, map[string]struct{}, map[strin
 }
 
 func validRelativePath(path string) bool {
-	return path != "" && path != "." && !filepath.IsAbs(path) && path != ".." && !strings.HasPrefix(path, "../") && !strings.ContainsRune(path, '\x00')
+	// Git paths are relative slash paths on every platform. Host-specific
+	// absolute checks miss portable roots and Windows drive-relative paths.
+	return path != "" && path != "." && path != ".." &&
+		!strings.HasPrefix(path, "/") && !strings.HasPrefix(path, `\`) &&
+		!(len(path) >= 2 && path[1] == ':') &&
+		!strings.HasPrefix(path, "../") && !strings.ContainsRune(path, '\x00')
 }
 
 type checkIgnoreOracle struct {

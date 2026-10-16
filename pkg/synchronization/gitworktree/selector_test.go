@@ -842,10 +842,23 @@ func TestDiagnoseRejectsUnsafePaths(t *testing.T) {
 		t.Fatal("unable to construct Git selector:", err)
 	}
 	t.Cleanup(func() { ignorer.Close() })
-	for _, path := range []string{"", ".", "..", "../escape", "/absolute", "nul\x00byte"} {
-		if _, err := ignorer.Diagnose(path, false); err == nil {
-			t.Fatalf("diagnosis accepted unsafe path %q", path)
-		}
+	for _, path := range []string{
+		"", ".", "..", "../escape", "/absolute", "nul\x00byte",
+		`\absolute`, `C:/absolute`, `C:\absolute`, `C:relative`,
+		`//server/share/file`, `\\server\share\file`, `\\?\C:\absolute`,
+	} {
+		t.Run(path, func(t *testing.T) {
+			if _, err := ignorer.Diagnose(path, false); err == nil {
+				t.Errorf("diagnosis accepted unsafe path %q", path)
+			}
+		})
+	}
+	for _, path := range []string{"ordinary.txt", "nested/file.txt", "notes:todo.txt"} {
+		t.Run(path, func(t *testing.T) {
+			if _, err := ignorer.Diagnose(path, false); err != nil {
+				t.Errorf("diagnosis rejected relative path %q: %v", path, err)
+			}
+		})
 	}
 }
 
