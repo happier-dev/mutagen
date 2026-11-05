@@ -99,6 +99,12 @@ type listCommand struct {
 	Limit     int    `json:"limit,omitempty"`
 }
 
+type waitForChangeCommand struct {
+	T                  string `json:"t"`
+	RequestID          string `json:"requestId"`
+	PreviousStateIndex string `json:"previousStateIndex"`
+}
+
 type sessionEndpointSummary struct {
 	Protocol url.Protocol                 `json:"protocol"`
 	Host     string                       `json:"host"`
@@ -197,6 +203,8 @@ func serveEngineWithShutdown(ctx context.Context, broker *BrokerClient, manager 
 		return errors.New("nil synchronization manager shutdown")
 	}
 	engineContext, stopEngine := context.WithCancel(ctx)
+	observationContext, stopObservations := context.WithCancel(engineContext)
+	defer stopObservations()
 	var workers sync.WaitGroup
 	var shutdownOnce sync.Once
 	defer func() {
@@ -208,7 +216,7 @@ func serveEngineWithShutdown(ctx context.Context, broker *BrokerClient, manager 
 	var orderLock sync.Mutex
 	orderedTails := make(map[string]chan struct{})
 	workerFailure := make(chan error, 1)
-	dispatch := func(incoming BrokerCommand, serialKey string) {
+	dispatch := func(incoming BrokerCommand, serialKey string, observation bool) {
 		var previous <-chan struct{}
 		var complete chan struct{}
 		if serialKey != "" {
@@ -236,6 +244,10 @@ func serveEngineWithShutdown(ctx context.Context, broker *BrokerClient, manager 
 			commandContext, stopCommand := context.WithCancel(incoming.Context)
 			stopEnginePropagation := context.AfterFunc(engineContext, stopCommand)
 			defer stopEnginePropagation()
+			if observation {
+				stopObservationPropagation := context.AfterFunc(observationContext, stopCommand)
+				defer stopObservationPropagation()
+			}
 			defer stopCommand()
 			defer broker.FinishCommand(incoming.RequestID)
 
@@ -275,8 +287,11 @@ func serveEngineWithShutdown(ctx context.Context, broker *BrokerClient, manager 
 			if !ok {
 				return broker.Err()
 			}
-			serialKey, shutdownCommand := commandScheduling(incoming.Raw)
+			serialKey, shutdownCommand, observation := commandScheduling(incoming.Raw)
 			if shutdownCommand {
+				// Parked reads have no natural completion until change. Cancel them
+				// before draining admitted mutations, then shut the manager down.
+				stopObservations()
 				drained := make(chan struct{})
 				go func() {
 					workers.Wait()
@@ -306,7 +321,7 @@ func serveEngineWithShutdown(ctx context.Context, broker *BrokerClient, manager 
 				}
 				return nil
 			}
-			dispatch(incoming, serialKey)
+			dispatch(incoming, serialKey, observation)
 		}
 	}
 }
@@ -315,33 +330,35 @@ func serveEngineWithShutdown(ctx context.Context, broker *BrokerClient, manager 
 // receipt order. Read-only commands are intentionally concurrent, and malformed
 // commands are left to the strict executor so that scheduling never becomes a
 // second protocol validator.
-func commandScheduling(raw json.RawMessage) (string, bool) {
+func commandScheduling(raw json.RawMessage) (string, bool, bool) {
 	var envelope commandEnvelope
 	if err := decodeCommandStrict(raw, &envelope); err != nil || envelope.T != "command" {
-		return "", false
+		return "", false, false
 	}
 	var tag commandTag
 	if err := json.Unmarshal(envelope.Command, &tag); err != nil || tag.RequestID != envelope.RequestID {
-		return "", false
+		return "", false, false
 	}
 	switch tag.T {
+	case "wait_for_change":
+		return "", false, true
 	case "create":
 		var command createCommand
 		if err := decodeCommandStrict(envelope.Command, &command); err == nil && command.Session.Name != "" {
-			return "session:" + command.Session.Name, false
+			return "session:" + command.Session.Name, false, false
 		}
 	case "flush", "pause", "resume", "terminate":
 		var command selectedCommand
 		if err := decodeCommandStrict(envelope.Command, &command); err == nil && validIdentifier(command.SessionIdentifier) {
-			return "session:" + command.SessionIdentifier, false
+			return "session:" + command.SessionIdentifier, false, false
 		}
 	case "shutdown":
 		var command listCommand
 		if err := decodeCommandStrict(envelope.Command, &command); err == nil {
-			return "", true
+			return "", true, false
 		}
 	}
-	return "", false
+	return "", false, false
 }
 
 func executeCommand(ctx context.Context, manager *synchronization.Manager, raw json.RawMessage) (any, bool, error) {
@@ -450,6 +467,22 @@ func executeCommand(ctx context.Context, manager *synchronization.Manager, raw j
 			return page, false, err
 		}
 		return nil, false, errors.New("invalid selected command")
+	case "wait_for_change":
+		var command waitForChangeCommand
+		if err := decodeCommandStrict(envelope.Command, &command); err != nil {
+			return nil, false, err
+		}
+		previous, err := strconv.ParseUint(command.PreviousStateIndex, 10, 64)
+		if err != nil || strconv.FormatUint(previous, 10) != command.PreviousStateIndex {
+			return nil, false, errors.New("invalid previous state index")
+		}
+		// Mutagen v0.18.1: zero reads immediately; a retained index parks on
+		// the manager's condition variable until change, cancellation or shutdown.
+		index, _, err := manager.List(ctx, &selection.Selection{All: true}, previous)
+		if err != nil {
+			return nil, false, err
+		}
+		return map[string]string{"stateIndex": strconv.FormatUint(index, 10)}, false, nil
 	case "list":
 		var command listCommand
 		if err := decodeCommandStrict(envelope.Command, &command); err != nil || command.Limit < 1 || command.Limit > 100 || (command.Cursor != "" && !validIdentifier(command.Cursor)) {

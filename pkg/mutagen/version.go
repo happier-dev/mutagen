@@ -19,7 +19,7 @@ const (
 	// VersionTag represents a tag to be appended to the Mutagen version string.
 	// It must not contain spaces. If empty, no tag is appended to the version
 	// string.
-	VersionTag = ""
+	VersionTag = "happier.12"
 )
 
 // DevelopmentModeEnabled indicates that development mode is active. This is
@@ -32,7 +32,7 @@ var Version string
 // BuildIdentity is injected with the immutable fork commit for release builds.
 // Development builds share an explicit non-release identity so stock Mutagen
 // binaries and differently pinned Happier artifacts fail the handshake.
-var BuildIdentity = "happier-external-stream-v1+development"
+var BuildIdentity = "happier-external-stream-v1+sync-wait-v1"
 
 // init performs global initialization.
 func init() {

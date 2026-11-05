@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -18,6 +19,7 @@ import (
 	"github.com/mutagen-io/mutagen/pkg/agent"
 	synchronizationapi "github.com/mutagen-io/mutagen/pkg/api/models/synchronization"
 	"github.com/mutagen-io/mutagen/pkg/mutagen"
+	"github.com/mutagen-io/mutagen/pkg/selection"
 	"github.com/mutagen-io/mutagen/pkg/synchronization"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
@@ -26,6 +28,75 @@ import (
 	externalprotocol "github.com/mutagen-io/mutagen/pkg/synchronization/protocols/external"
 	"github.com/mutagen-io/mutagen/pkg/url"
 )
+
+func TestManagerChangeWaitPreservesIndexAndCancellation(t *testing.T) {
+	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
+	manager, err := synchronization.NewManager(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Shutdown()
+	wait := func(ctx context.Context, previous string) (string, error) {
+		result, _, err := executeCommand(ctx, manager, commandFrame(t, "wait-1", map[string]any{
+			"t": "wait_for_change", "requestId": "wait-1", "previousStateIndex": previous,
+		}))
+		if err != nil {
+			return "", err
+		}
+		encoded, err := json.Marshal(result)
+		if err != nil {
+			return "", err
+		}
+		var response struct {
+			StateIndex string `json:"stateIndex"`
+		}
+		if err := json.Unmarshal(encoded, &response); err != nil {
+			return "", err
+		}
+		return response.StateIndex, nil
+	}
+	index, err := wait(context.Background(), "0")
+	if err != nil || index == "" || index == "0" {
+		t.Fatalf("initial index missing: %q %v", index, err)
+	}
+	for _, invalid := range []string{"01", "-1", "18446744073709551616"} {
+		if _, err := wait(context.Background(), invalid); err == nil {
+			t.Fatalf("invalid index accepted: %s", invalid)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := wait(ctx, index); done <- err }()
+	select {
+	case err := <-done:
+		t.Fatalf("idle wait returned: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("wait lost cancellation: %v", err)
+	}
+	alpha, err := url.Parse("external://alpha", url.Kind_Synchronization, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beta, err := url.Parse("external://beta", url.Kind_Synchronization, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identifier, err := manager.Create(context.Background(), alpha, beta, &synchronization.Configuration{}, &synchronization.Configuration{}, &synchronization.Configuration{}, "paused", nil, true, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err := wait(context.Background(), index)
+	if err != nil || changed == index {
+		t.Fatalf("native change did not advance wait: %q %v", changed, err)
+	}
+	if err := manager.Terminate(context.Background(), &selection.Selection{Specifications: []string{identifier}}, ""); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestCommandDecoderRejectsProductOwnedWorkspaceCommands(t *testing.T) {
 	tests := []struct {
@@ -389,7 +460,7 @@ func TestExecuteCommandDecodesMaximumPolicyAboveResponseFrameLimit(t *testing.T)
 	if len(raw) <= MaximumControlFrameBytes {
 		t.Fatalf("test command did not cross response frame boundary: %d", len(raw))
 	}
-	if serialKey, shutdown := commandScheduling(raw); serialKey != "session:large-session" || shutdown {
+	if serialKey, shutdown, _ := commandScheduling(raw); serialKey != "session:large-session" || shutdown {
 		t.Fatalf("large command did not pass engine scheduling decode: key=%q shutdown=%v", serialKey, shutdown)
 	}
 	result, _, err := executeCommand(context.Background(), manager, raw)
@@ -617,14 +688,32 @@ func TestServeEngineAcknowledgesShutdownOnlyAfterManagerShutdownCompletes(t *tes
 	defer testConnection.Close()
 	shutdownStarted := make(chan struct{})
 	releaseShutdown := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseShutdown) }) }
+	defer release()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	waitStarted := make(chan struct{})
+	execute := func(ctx context.Context, manager *synchronization.Manager, raw json.RawMessage) (any, bool, error) {
+		if strings.Contains(string(raw), "wait_for_change") {
+			close(waitStarted)
+		}
+		return executeCommand(ctx, manager, raw)
+	}
 	engineResult := make(chan error, 1)
 	go func() {
-		engineResult <- serveEngineWithShutdown(context.Background(), broker, manager, executeCommand, func() {
+		engineResult <- serveEngineWithShutdown(ctx, broker, manager, execute, func() {
 			close(shutdownStarted)
 			<-releaseShutdown
 			manager.Shutdown()
 		})
 	}()
+	broker.commands <- BrokerCommand{
+		RequestID: "wait-1",
+		Raw:       commandFrame(t, "wait-1", map[string]any{"t": "wait_for_change", "requestId": "wait-1", "previousStateIndex": "1"}),
+		Context:   context.Background(),
+	}
+	<-waitStarted
 	broker.commands <- BrokerCommand{
 		RequestID: "shutdown-1",
 		Raw:       commandFrame(t, "shutdown-1", map[string]any{"t": "shutdown", "requestId": "shutdown-1"}),
@@ -652,7 +741,7 @@ func TestServeEngineAcknowledgesShutdownOnlyAfterManagerShutdownCompletes(t *tes
 		t.Fatal("unable to await shutdown response:", err)
 	case <-time.After(100 * time.Millisecond):
 	}
-	close(releaseShutdown)
+	release()
 	select {
 	case raw := <-response:
 		var result struct{ T, RequestID string }
